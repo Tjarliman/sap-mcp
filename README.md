@@ -22,12 +22,6 @@ Use the absolute path to `server.js` on this machine:
 claude mcp add sap-adt --scope user -- node /absolute/path/to/sap-mcp/server.js
 ```
 
-Optional companion (remote, no install needed):
-
-```bash
-claude mcp add --transport http sap-docs https://mcp-sap-docs.marianzeis.de/mcp --scope user
-```
-
 ## Credentials
 
 Each person uses their **own named SAP user** per system. All connection
