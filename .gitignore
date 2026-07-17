@@ -1,0 +1,5 @@
+.env
+node_modules/
+
+# Unrelated one-off script, not part of the MCP server
+gen_ap_aging.cjs
