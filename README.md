@@ -61,3 +61,8 @@ implied. You use it entirely **at your own risk**.
 - **Not affiliated with SAP.** SAP and S/4HANA are trademarks of SAP SE. This
   is an independent, unofficial tool and is not endorsed by or affiliated with
   SAP SE.
+
+## License
+
+[MIT](LICENSE). The license text includes the binding "as is" / no-warranty /
+no-liability terms; the Disclaimer above restates them in plain language.

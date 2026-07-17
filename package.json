@@ -4,6 +4,7 @@
   "description": "MCP server for SAP S/4HANA via ADT API",
   "type": "module",
   "main": "server.js",
+  "license": "MIT",
   "scripts": {
     "start": "node server.js"
   },
