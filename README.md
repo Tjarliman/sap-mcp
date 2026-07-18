@@ -4,39 +4,47 @@ MCP server for SAP S/4HANA via the ADT API. Runs locally over stdio.
 
 ## Setup on a new machine
 
-Requires **Node.js >= 20.12** (needs `process.loadEnvFile`).
+**Prerequisites** (install these first):
+
+- **Node.js >= 20.12** (needs `process.loadEnvFile`; also provides `npm`)
+- **git**
+- **Claude Code** (for the registration step)
+- **Network/VPN reachability** to your SAP hosts (e.g. `fiori-dev...`)
+
+Then:
 
 ```bash
-git clone <repo-url> sap-mcp
+git clone https://github.com/Tjarliman/sap-mcp.git
 cd sap-mcp
 npm install
-cp .env.example .env        # Windows: copy .env.example .env
-# then edit .env and fill in YOUR OWN SAP credentials
+cp .env.example .env      # PowerShell/CMD: copy .env.example .env
 ```
 
-## Register with Claude Code
-
-Use the absolute path to `server.js` on this machine:
+Now **edit `.env`** and fill in the real `HOST`/`CLIENT` for each system plus
+**your own** SAP `USER`/`PASS`. The real hostnames are intentionally not in this
+repo — get them from whoever maintains it. Then verify and register:
 
 ```bash
-claude mcp add sap-adt --scope user -- node /absolute/path/to/sap-mcp/server.js
+node test.mjs             # PASS = install OK  (does NOT check credentials)
+node test.mjs --live      # PASS = credentials + SAP reachable  <-- the real proof
+
+# Register with Claude Code (use the ABSOLUTE path to server.js on this machine):
+claude mcp add sap-adt --scope user -- node C:\Users\<name>\sap-mcp\server.js
 ```
+
+Start a **fresh Claude Code session** afterwards for the server to load.
+
+> `node test.mjs` reports PASS even before you edit `.env` — it only checks that
+> the server boots and loads profiles. `node test.mjs --live` is what actually
+> confirms your credentials and SAP connectivity.
 
 ## Testing your install
 
-After `npm install` and filling in `.env`, verify it works with the bundled
-self-check (no Claude Code needed):
+The `node test.mjs` / `node test.mjs --live` steps above are the self-check
+(`npm test` runs the structural one). The bundled harness talks to the server
+over stdio — no Claude Code needed.
 
-```bash
-node test.mjs          # structural: boots the server, lists tools, reads your profiles
-node test.mjs --live   # also runs a harmless read (T000) against the active SAP system
-```
-
-`node test.mjs` should end with `PASS`. Use `--live` to confirm credentials and
-network reachability to the SAP host — if that step fails, it's almost always
-VPN/network or credentials, not the code. (`npm test` runs the structural check.)
-
-You can also verify through Claude Code once registered — ask it to run
+Once registered, you can also verify through Claude Code — ask it to run
 `list_servers`, or a `query_table` with `SELECT MANDT, MTEXT FROM T000`.
 
 ## Credentials
