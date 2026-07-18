@@ -158,15 +158,24 @@ function parseDataPreview(xml) {
 }
 
 function parseObjectRefs(xml) {
-  const matches = [...xml.matchAll(
-    /adtcore:name="([^"]+)"[^>]*adtcore:type="([^"]+)"[^>]*adtcore:packageName="([^"]+)"[^>]*adtcore:description="([^"]*)"/g
-  )];
-  return matches.map(m => ({
-    name: m[1],
-    type: m[2],
-    package: m[3],
-    description: m[4],
-  }));
+  // Pull each <adtcore:objectReference> element and read its attributes
+  // independently. ADT does not emit them in a fixed order (it returns
+  // type before name), so an order-dependent regex silently matches nothing.
+  const refs = [];
+  for (const m of xml.matchAll(/<adtcore:objectReference\b[^>]*?\/?>/g)) {
+    const tag = m[0];
+    const attr = (n) => (tag.match(new RegExp(`adtcore:${n}="([^"]*)"`)) || [])[1] || "";
+    const name = attr("name");
+    if (name) {
+      refs.push({
+        name,
+        type: attr("type"),
+        package: attr("packageName"),
+        description: attr("description"),
+      });
+    }
+  }
+  return refs;
 }
 
 const server = new McpServer({
