@@ -142,6 +142,32 @@ function parseActivationMessages(xml) {
   });
 }
 
+// Activate an object over a stateful `call`. MUST run AFTER the edit lock is
+// released: ADT rejects activation while the object is still locked
+// ("<user> is currently editing <object>"). Appends the outcome to `log`.
+async function runActivation(call, uri, name, log, kind) {
+  const actBody =
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+    `  <adtcore:objectReference adtcore:uri="${uri}" adtcore:name="${escapeXml(name)}"/>\n` +
+    `</adtcore:objectReferences>`;
+  const act = await call(`/sap/bc/adt/activation?method=activate&preauditRequests=false`, {
+    method: "POST",
+    headers: { "Content-Type": "application/xml" },
+    body: actBody,
+  });
+  const msgs = parseActivationMessages(act.text);
+  const bad = msgs.filter(m => /^[EAW]$/i.test(m.type));
+  if (!act.ok || bad.length) {
+    log.push(`ACTIVATION FAILED (HTTP ${act.status}) - the ${kind} exists but is INACTIVE.`);
+    for (const m of (bad.length ? bad : msgs)) log.push(`  [${m.type}] ${m.text}`);
+    // Never swallow the response: without it there is nothing to debug.
+    if (!bad.length) log.push(`  Raw response: ${(act.text || "(empty body)").slice(0, 1500)}`);
+  } else {
+    log.push("Activated cleanly.");
+  }
+}
+
 function parseDataPreview(xml) {
   const totalMatch = xml.match(/<dataPreview:totalRows>(\d+)<\/dataPreview:totalRows>/);
   const total = totalMatch ? parseInt(totalMatch[1]) : 0;
@@ -439,34 +465,115 @@ server.tool(
       );
       if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
       log.push(`Source written (${source.split("\n").length} lines).`);
-
-      if (activate) {
-        const actBody =
-          `<?xml version="1.0" encoding="UTF-8"?>\n` +
-          `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">\n` +
-          `  <adtcore:objectReference adtcore:uri="${uri}" adtcore:name="${escapeXml(name)}"/>\n` +
-          `</adtcore:objectReferences>`;
-        const act = await call(`/sap/bc/adt/activation?method=activate&preauditRequests=false`, {
-          method: "POST",
-          headers: { "Content-Type": "application/xml" },
-          body: actBody,
-        });
-        const msgs = parseActivationMessages(act.text);
-        const bad = msgs.filter(m => /^[EAW]$/i.test(m.type));
-        if (!act.ok || bad.length) {
-          log.push(`ACTIVATION FAILED (HTTP ${act.status}) - the class exists but is INACTIVE.`);
-          for (const m of (bad.length ? bad : msgs)) log.push(`  [${m.type}] ${m.text}`);
-          // Never swallow the response: without it there is nothing to debug.
-          if (!bad.length) log.push(`  Raw response: ${(act.text || "(empty body)").slice(0, 1500)}`);
-        } else {
-          log.push("Activated cleanly.");
-        }
-      }
     } finally {
       const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
         method: "POST",
       });
       log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    // Activate AFTER the edit lock is released - activating a still-locked
+    // object is rejected by ADT ("... is currently editing ...").
+    if (activate) {
+      await runActivation(call, uri, name, log, "class");
+    }
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "create_cds",
+  "Create a new CDS view (Data Definition / DDLS) in SAP and activate it. " +
+  "Refuses to run on production profiles. Provide the complete CDS source " +
+  "(e.g. 'define view entity <name> as select from ... { ... }'); the entity " +
+  "name in the source must match cdsName. Needs a transport unless package is $TMP.",
+  {
+    cdsName: z.string().describe("CDS entity/DDLS name, e.g. ZKIT_I_PRODUCT. Must match the name in the source."),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete CDS DDL source (define view entity <name> as select from ... { ... })"),
+    transport: z.string().optional().describe("Transport request, e.g. ABLK900123. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ cdsName, description, packageName, source, transport: corrNr, activate }) => {
+    assertWritable();
+
+    const name = cdsName.toUpperCase();
+    const uri = `/sap/bc/adt/ddic/ddl/sources/${cdsName.toLowerCase()}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, text };
+    };
+
+    // 1) create the (empty) DDL source shell. The content type is the
+    //    UNVERSIONED one; the .v2 variant returns 415 Unsupported Media Type.
+    const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<ddl:ddlSource xmlns:ddl="http://www.sap.com/adt/ddic/ddlsources" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="DDLS/DF" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</ddl:ddlSource>`;
+
+    const created = await call(`/sap/bc/adt/ddic/ddl/sources${corrQuery}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.sap.adt.ddlSource+xml" },
+      body: shell,
+    });
+    if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+    log.push(`Created DDL source ${name} in package ${packageName.toUpperCase()}${corrNr ? ` on ${corrNr}` : ""}.`);
+
+    // 2) lock  3) put source  4) unlock — all on the one stateful session
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written (${source.split("\n").length} lines).`);
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+        method: "POST",
+      });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    // 5) activate AFTER unlocking (see runActivation / create_class note)
+    if (activate) {
+      await runActivation(call, uri, name, log, "CDS view");
     }
 
     return { content: [{ type: "text", text: log.join("\n") }] };
