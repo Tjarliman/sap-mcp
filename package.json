@@ -6,7 +6,8 @@
   "main": "server.js",
   "license": "MIT",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test.mjs"
   },
   "engines": {
     "node": ">=20.12"

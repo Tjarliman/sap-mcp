@@ -22,6 +22,23 @@ Use the absolute path to `server.js` on this machine:
 claude mcp add sap-adt --scope user -- node /absolute/path/to/sap-mcp/server.js
 ```
 
+## Testing your install
+
+After `npm install` and filling in `.env`, verify it works with the bundled
+self-check (no Claude Code needed):
+
+```bash
+node test.mjs          # structural: boots the server, lists tools, reads your profiles
+node test.mjs --live   # also runs a harmless read (T000) against the active SAP system
+```
+
+`node test.mjs` should end with `PASS`. Use `--live` to confirm credentials and
+network reachability to the SAP host — if that step fails, it's almost always
+VPN/network or credentials, not the code. (`npm test` runs the structural check.)
+
+You can also verify through Claude Code once registered — ask it to run
+`list_servers`, or a `query_table` with `SELECT MANDT, MTEXT FROM T000`.
+
 ## Credentials
 
 Each person uses their **own named SAP user** per system. All connection
