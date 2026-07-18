@@ -38,7 +38,7 @@ function conn(key, label) {
 const PROFILES = {
   "ABLD":   conn("ABLD",   "Development"),
   "dev120": conn("dev120", "Development (client 120)"),
-  "snet":   conn("snet",   "QA/Test 2022"),
+  "snet":   conn("snet",   "QA/Test"),
   "ABLP":   conn("ABLP",   "Production"),
   "snet2":  conn("snet2",  "S/4HANA on-prem"),
   // To add a profile: add an entry here, then set SAP_<NAME>_HOST,
