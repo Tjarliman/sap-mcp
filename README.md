@@ -6,10 +6,10 @@ MCP server for SAP S/4HANA via the ADT API. Runs locally over stdio.
 
 **Prerequisites** (install these first):
 
-- **Node.js >= 20.12** (needs `process.loadEnvFile`; also provides `npm`)
-- **git**
-- **Claude Code** (for the registration step)
-- **Network/VPN reachability** to your SAP hosts (e.g. `fiori-dev...`)
+- **Node.js >= 20.12** (needs `process.loadEnvFile`; also provides `npm`) — required
+- **Claude Code** — required to use the server (only the registration step needs it)
+- **Network/VPN reachability** to your SAP hosts (e.g. `fiori-dev...`) — required
+- **git** — optional; only used for `git clone`. No git? See below.
 
 Then:
 
@@ -19,6 +19,11 @@ cd sap-mcp
 npm install
 cp .env.example .env      # PowerShell/CMD: copy .env.example .env
 ```
+
+> **No git?** Instead of `git clone`, download the repo from GitHub: green
+> **Code** button -> **Download ZIP**, unzip it, then `cd` into the folder and
+> continue from `npm install`. (git is only nicer later, for pulling updates
+> with `git pull` instead of re-downloading.)
 
 Now **edit `.env`** and fill in the real `HOST`/`CLIENT` for each system plus
 **your own** SAP `USER`/`PASS`. The real hostnames are intentionally not in this
