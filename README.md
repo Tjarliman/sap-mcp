@@ -10,6 +10,8 @@ MCP server for SAP S/4HANA via the ADT API. Runs locally over stdio.
 - **Claude Code** — required to use the server (only the registration step needs it)
 - **Network/VPN reachability** to your SAP hosts (e.g. `fiori-dev...`) — required
 - **git** — optional; only used for `git clone`. No git? See below.
+  (To install on Windows: `winget install --id Git.Git -e`, then **reopen your
+  terminal**. macOS: `brew install git`. Verify with `git --version`.)
 
 Then:
 
