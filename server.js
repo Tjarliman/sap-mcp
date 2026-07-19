@@ -168,6 +168,79 @@ async function runActivation(call, uri, name, log, kind) {
   }
 }
 
+// Shared create-and-activate flow for ADT text-source objects that follow the
+// same pattern: CDS view (DDLS), service definition (SRVD), behavior definition
+// (BDEF). Create shell -> lock -> PUT source -> unlock -> activate. Activation
+// MUST run after unlock (see runActivation). Returns the log text.
+async function createSourceObject({ name, uri, createEndpoint, contentType, shell, source, corrNr, activate, kind }) {
+  assertWritable();
+  const host = profile().host;
+  const log = [];
+
+  const { token, cookies: initialCookies } = await fetchCsrfToken();
+  let cookies = initialCookies;
+  if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+  const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+    const res = await fetch(`${host}${path}`, {
+      method,
+      headers: {
+        ...authHeaders(accept),
+        "X-CSRF-Token": token,
+        "x-sap-adt-sessiontype": "stateful",
+        Cookie: cookies,
+        ...headers,
+      },
+      body,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  };
+
+  // 1) create the (empty) object shell
+  const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+  const created = await call(`${createEndpoint}${corrQuery}`, {
+    method: "POST",
+    headers: { "Content-Type": contentType },
+    body: shell,
+  });
+  if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+  log.push(`Created ${kind} ${name}${corrNr ? ` on ${corrNr}` : ""}.`);
+
+  // 2) lock  3) put source  4) unlock — all on the one stateful session
+  const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+    method: "POST",
+    accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+  });
+  if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+  const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+  if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+  log.push("Locked.");
+
+  try {
+    const put = await call(
+      `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
+      (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+      { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+    );
+    if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+    log.push(`Source written (${source.split("\n").length} lines).`);
+  } finally {
+    const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+      method: "POST",
+    });
+    log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+  }
+
+  // 5) activate AFTER unlocking (activating a still-locked object is rejected)
+  if (activate) {
+    await runActivation(call, uri, name, log, kind);
+  }
+
+  return log.join("\n");
+}
+
 function parseDataPreview(xml) {
   const totalMatch = xml.match(/<dataPreview:totalRows>(\d+)<\/dataPreview:totalRows>/);
   const total = totalMatch ? parseInt(totalMatch[1]) : 0;
@@ -497,38 +570,8 @@ server.tool(
     activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
   },
   async ({ cdsName, description, packageName, source, transport: corrNr, activate }) => {
-    assertWritable();
-
     const name = cdsName.toUpperCase();
-    const uri = `/sap/bc/adt/ddic/ddl/sources/${cdsName.toLowerCase()}`;
-    const host = profile().host;
-    const log = [];
-
-    const { token, cookies: initialCookies } = await fetchCsrfToken();
-    let cookies = initialCookies;
-    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
-
-    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
-      const res = await fetch(`${host}${path}`, {
-        method,
-        headers: {
-          ...authHeaders(accept),
-          "X-CSRF-Token": token,
-          "x-sap-adt-sessiontype": "stateful",
-          Cookie: cookies,
-          ...headers,
-        },
-        body,
-        agent,
-      });
-      cookies = mergeCookies(cookies, res);
-      const text = await res.text();
-      return { ok: res.ok, status: res.status, text };
-    };
-
-    // 1) create the (empty) DDL source shell. The content type is the
-    //    UNVERSIONED one; the .v2 variant returns 415 Unsupported Media Type.
-    const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+    // Content type is the UNVERSIONED one; the .v2 variant returns 415.
     const shell =
       `<?xml version="1.0" encoding="UTF-8"?>\n` +
       `<ddl:ddlSource xmlns:ddl="http://www.sap.com/adt/ddic/ddlsources" ` +
@@ -537,46 +580,87 @@ server.tool(
       `adtcore:type="DDLS/DF" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
       `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
       `</ddl:ddlSource>`;
-
-    const created = await call(`/sap/bc/adt/ddic/ddl/sources${corrQuery}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/vnd.sap.adt.ddlSource+xml" },
-      body: shell,
+    const text = await createSourceObject({
+      name,
+      uri: `/sap/bc/adt/ddic/ddl/sources/${cdsName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/ddic/ddl/sources",
+      contentType: "application/vnd.sap.adt.ddlSource+xml",
+      shell, source, corrNr, activate, kind: "CDS view",
     });
-    if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
-    log.push(`Created DDL source ${name} in package ${packageName.toUpperCase()}${corrNr ? ` on ${corrNr}` : ""}.`);
+    return { content: [{ type: "text", text }] };
+  }
+);
 
-    // 2) lock  3) put source  4) unlock — all on the one stateful session
-    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
-      method: "POST",
-      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+server.tool(
+  "create_srvd",
+  "Create a new Service Definition (SRVD) in SAP and activate it. Refuses to run on " +
+  "production profiles. Provide the complete source (e.g. 'define service <name> " +
+  "{ expose <entity>; }'); the service name must match srvdName. Needs a transport " +
+  "unless package is $TMP.",
+  {
+    srvdName: z.string().describe("Service definition name, e.g. ZKIT_UI_PRODUCT. Must match the name in the source."),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete SRVD source (define service <name> { expose <entity>; })"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ srvdName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = srvdName.toUpperCase();
+    // srvd:srvdSourceType="S" (Definition) is required, else create 400s.
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<srvd:srvdSource xmlns:srvd="http://www.sap.com/adt/ddic/srvdsources" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" srvd:srvdSourceType="S" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="SRVD/SRV" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</srvd:srvdSource>`;
+    const text = await createSourceObject({
+      name,
+      uri: `/sap/bc/adt/ddic/srvd/sources/${srvdName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/ddic/srvd/sources",
+      contentType: "application/vnd.sap.adt.ddic.srvd.v1+xml",
+      shell, source, corrNr, activate, kind: "service definition",
     });
-    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
-    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
-    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
-    log.push("Locked.");
+    return { content: [{ type: "text", text }] };
+  }
+);
 
-    try {
-      const put = await call(
-        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
-        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
-        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
-      );
-      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
-      log.push(`Source written (${source.split("\n").length} lines).`);
-    } finally {
-      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
-        method: "POST",
-      });
-      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
-    }
-
-    // 5) activate AFTER unlocking (see runActivation / create_class note)
-    if (activate) {
-      await runActivation(call, uri, name, log, "CDS view");
-    }
-
-    return { content: [{ type: "text", text: log.join("\n") }] };
+server.tool(
+  "create_bdef",
+  "Create a new Behavior Definition (BDEF) in SAP and activate it. Refuses to run on " +
+  "production profiles. bdefName must equal the root entity the behavior is for, and " +
+  "that entity must already exist. Provide the complete source (e.g. 'managed " +
+  "implementation in class <cls> unique; define behavior for <entity> ... { ... }'). " +
+  "A managed BDEF needs its persistent table + implementation class to exist for " +
+  "activation to succeed. Needs a transport unless package is $TMP.",
+  {
+    bdefName: z.string().describe("Behavior definition name = the root entity it is defined for, e.g. ZKIT_R_PRODUCT."),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete BDEF source (define behavior for <entity> ... { ... })"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ bdefName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = bdefName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<blue:blueSource xmlns:blue="http://www.sap.com/wbobj/blue" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="BDEF/BDO" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</blue:blueSource>`;
+    const text = await createSourceObject({
+      name,
+      uri: `/sap/bc/adt/bo/behaviordefinitions/${bdefName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/bo/behaviordefinitions",
+      contentType: "application/vnd.sap.adt.blues.v1+xml",
+      shell, source, corrNr, activate, kind: "behavior definition",
+    });
+    return { content: [{ type: "text", text }] };
   }
 );
 
