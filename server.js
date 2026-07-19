@@ -701,6 +701,117 @@ server.tool(
 );
 
 server.tool(
+  "create_srvb",
+  "Create a Service Binding (SRVB) that exposes a service definition as an OData service, " +
+  "then activate and publish it. Refuses to run on production profiles. The service " +
+  "definition must already exist and be active. Publishing may require a transport on " +
+  "clients set to auto-record; if it can't publish, the binding is still created and active.",
+  {
+    srvbName: z.string().describe("Service binding name, e.g. ZKIT_UI_PRODUCT_O4."),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    serviceDefinition: z.string().describe("Name of the service definition (SRVD) to bind, e.g. ZKIT_UI_PRODUCT."),
+    odataVersion: z.enum(["V4", "V2"]).optional().default("V4").describe("OData protocol version (default V4)."),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate the binding after creating it."),
+    publish: z.boolean().optional().default(true).describe("Publish the OData service after activating."),
+  },
+  async ({ srvbName, description, packageName, serviceDefinition, odataVersion, transport: corrNr, activate, publish }) => {
+    assertWritable();
+
+    const name = srvbName.toUpperCase();
+    const srvdName = serviceDefinition.toUpperCase();
+    const srvdUri = `/sap/bc/adt/ddic/srvd/sources/${serviceDefinition.toLowerCase()}`;
+    const uri = `/sap/bc/adt/businessservices/bindings/${srvbName.toLowerCase()}`;
+    const odataColl = odataVersion === "V2" ? "odatav2" : "odatav4";
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    // 1) create the binding: one POST of the full config referencing the SRVD
+    const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+    const cfg =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<srvb:serviceBinding srvb:releaseSupported="false" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="SRVB/SVB" adtcore:description="${escapeXml(description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN" ` +
+      `xmlns:srvb="http://www.sap.com/adt/ddic/ServiceBindings" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `  <srvb:services srvb:name="${escapeXml(name)}">\n` +
+      `    <srvb:content srvb:version="0001" srvb:releaseState="NOT_RELEASED">\n` +
+      `      <srvb:serviceDefinition adtcore:uri="${srvdUri}" adtcore:type="SRVD/SRV" adtcore:name="${escapeXml(srvdName)}"/>\n` +
+      `      <srvb:bindingTypeData><adtcore:content adtcore:encoding="base64"/></srvb:bindingTypeData>\n` +
+      `    </srvb:content>\n` +
+      `  </srvb:services>\n` +
+      `  <srvb:binding srvb:type="ODATA" srvb:version="${odataVersion}" srvb:category="0">\n` +
+      `    <srvb:implementation adtcore:name="${escapeXml(name)}"/>\n` +
+      `  </srvb:binding>\n` +
+      `</srvb:serviceBinding>`;
+
+    const created = await call(`/sap/bc/adt/businessservices/bindings${corrQuery}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.sap.adt.businessservices.servicebinding.v2+xml" },
+      body: cfg,
+    });
+    if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+    log.push(`Created service binding ${name} (OData ${odataVersion}) for service definition ${srvdName}.`);
+
+    // 2) activate (service bindings have no source PUT/lock - just activate)
+    if (activate) {
+      await runActivation(call, uri, name, log, "service binding");
+    }
+
+    // 3) publish the OData service. Endpoint wants an objectReferences body and
+    //    Accept: application/vnd.sap.as+xml; it returns an asx result envelope.
+    if (publish) {
+      const pubBody =
+        `<?xml version="1.0" encoding="UTF-8"?>\n` +
+        `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+        `  <adtcore:objectReference adtcore:uri="${uri}" adtcore:name="${escapeXml(name)}"/>\n` +
+        `</adtcore:objectReferences>`;
+      const pr = await call(`/sap/bc/adt/businessservices/${odataColl}/publishjobs${corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : ""}`, {
+        method: "POST",
+        headers: { "Content-Type": `application/vnd.sap.adt.businessservices.${odataColl}.v1+xml` },
+        accept: "application/vnd.sap.as+xml",
+        body: pubBody,
+      });
+      const sev = (pr.text.match(/<SEVERITY>([^<]*)<\/SEVERITY>/) || [])[1] || "";
+      const shortText = (pr.text.match(/<SHORT_TEXT>([^<]*)<\/SHORT_TEXT>/) || [])[1] || "";
+      const longText = (pr.text.match(/<LONG_TEXT>([^<]*)<\/LONG_TEXT>/) || [])[1] || "";
+      if (!pr.ok || /ERROR|ABORT/i.test(sev)) {
+        log.push(`Publish did NOT complete (HTTP ${pr.status}${sev ? `, ${sev}` : ""}): ${shortText || pr.text.slice(0, 300)}${longText ? ` - ${longText}` : ""}`);
+        log.push("  The binding is created and active; publishing often needs a transport request on auto-record clients.");
+      } else {
+        log.push("Published - the OData service is now available.");
+      }
+    }
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
   "activate_object",
   "Activate one or more existing ABAP objects and report the raw activation result. " +
   "Pass a single object (objectUri + objectName), or several at once via `objects` - " +
