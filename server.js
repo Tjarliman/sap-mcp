@@ -665,23 +665,69 @@ server.tool(
 );
 
 server.tool(
-  "activate_object",
-  "Activate an existing ABAP object and report the raw activation result. " +
-  "Use to retry activation without recreating the object. Blocked on production profiles.",
+  "create_table",
+  "Create a new DDIC transparent table (TABL) in SAP and activate it. Refuses to run " +
+  "on production profiles. Provide the complete DDL source (define table <name> { ... }) " +
+  "INCLUDING the standard annotations (@AbapCatalog.tableCategory : #TRANSPARENT, " +
+  "@AbapCatalog.deliveryClass, @AbapCatalog.dataMaintenance), else the source is rejected. " +
+  "The table name in the source must match tableName. Needs a transport unless package is $TMP.",
   {
-    objectUri: z.string().describe("ADT URI, e.g. /sap/bc/adt/oo/classes/zcl_foo"),
-    objectName: z.string().describe("Object name, e.g. ZCL_FOO"),
+    tableName: z.string().describe("Table name, e.g. ZKIT_PRODUCT. Must match the name in the source."),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete DDL (define table <name> { key ...; ... }) with @AbapCatalog annotations."),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
   },
-  async ({ objectUri, objectName }) => {
+  async ({ tableName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = tableName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<blue:blueSource xmlns:blue="http://www.sap.com/wbobj/blue" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="TABL/DT" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</blue:blueSource>`;
+    const text = await createSourceObject({
+      name,
+      uri: `/sap/bc/adt/ddic/tables/${tableName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/ddic/tables",
+      contentType: "application/vnd.sap.adt.tables.v2+xml",
+      shell, source, corrNr, activate, kind: "table",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "activate_object",
+  "Activate one or more existing ABAP objects and report the raw activation result. " +
+  "Pass a single object (objectUri + objectName), or several at once via `objects` - " +
+  "activating together is required for mutually-dependent RAP objects, e.g. a behavior " +
+  "definition and its behavior implementation class. Blocked on production profiles.",
+  {
+    objectUri: z.string().optional().describe("ADT URI of a single object, e.g. /sap/bc/adt/oo/classes/zcl_foo"),
+    objectName: z.string().optional().describe("Name of the single object, e.g. ZCL_FOO"),
+    objects: z.array(z.object({
+      objectUri: z.string().describe("ADT URI"),
+      objectName: z.string().describe("Object name"),
+    })).optional().describe("Activate several objects together (needed for a BDEF + its behavior class)."),
+  },
+  async ({ objectUri, objectName, objects }) => {
     assertWritable();
 
+    const refs = [];
+    if (objectUri && objectName) refs.push({ uri: objectUri, name: objectName.toUpperCase() });
+    for (const o of objects || []) refs.push({ uri: o.objectUri, name: o.objectName.toUpperCase() });
+    if (!refs.length) throw new Error("Provide objectUri+objectName, or a non-empty objects array.");
+
     const { token, cookies: initial } = await fetchCsrfToken();
-    const name = objectName.toUpperCase();
     const body =
       `<?xml version="1.0" encoding="UTF-8"?>\n` +
       `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">\n` +
-      `  <adtcore:objectReference adtcore:uri="${objectUri}" adtcore:name="${escapeXml(name)}"/>\n` +
-      `</adtcore:objectReferences>`;
+      refs.map(r => `  <adtcore:objectReference adtcore:uri="${r.uri}" adtcore:name="${escapeXml(r.name)}"/>`).join("\n") +
+      `\n</adtcore:objectReferences>`;
 
     const res = await fetch(
       `${profile().host}/sap/bc/adt/activation?method=activate&preauditRequests=false`,
@@ -700,7 +746,7 @@ server.tool(
     const text = await res.text();
     const msgs = parseActivationMessages(text);
 
-    const out = [`HTTP ${res.status}`];
+    const out = [`HTTP ${res.status} (${refs.map(r => r.name).join(", ")})`];
     if (msgs.length) for (const m of msgs) out.push(`  [${m.type}] ${m.text}`);
     else out.push(`  Body: ${text ? text.slice(0, 2000) : "(empty - usually means success)"}`);
     return { content: [{ type: "text", text: out.join("\n") }] };
