@@ -45,6 +45,43 @@ Start a **fresh Claude Code session** afterwards for the server to load.
 > the server boots and loads profiles. `node test.mjs --live` is what actually
 > confirms your credentials and SAP connectivity.
 
+## Updating an existing install
+
+If you already have sap-mcp set up, pull the latest and **restart Claude Code**:
+
+```bash
+cd sap-mcp
+git pull            # no git? re-download the ZIP over your folder (keep your .env)
+npm install         # only needed if dependencies changed; harmless to run anyway
+node test.mjs       # confirm it still boots
+```
+
+You do **not** need to re-run `claude mcp add` — the registration persists. Your
+`.env` is never touched by an update (it's gitignored), so your credentials and
+profiles carry over.
+
+> **Important — quit and restart Claude Code after updating.** New tools are only
+> discovered when a Claude Code session **starts**. If an update adds a tool
+> (like `create_program` below), a reconnect or `/mcp` refresh is **not** enough:
+> fully quit Claude Code and open a fresh session. (Behaviour-only changes to
+> existing tools just need the server to respawn, which a new session also does.)
+
+To confirm the update loaded, start a fresh session and ask Claude to run
+`list_servers`, or check that the new tool is available.
+
+### What's new (2026-07)
+
+- **`create_program`** — create a brand-new classic ABAP report (executable
+  program, `PROG/P`) and activate it in one call. Previously the server could
+  only *edit* an existing program; now it can create one from scratch. Refuses
+  to run on production profiles. **This is a new tool, so you must restart
+  Claude Code after updating** (see above).
+- **Data-driven profiles** — profiles are now discovered from your `.env`: every
+  `SAP_<KEY>_HOST` you define becomes a switchable profile named `<KEY>`, with no
+  code change needed to add a system. Profile switching is case-insensitive.
+- **Production write-block widened** — writes are now blocked on both `ABLP`
+  (production) and `ABLQ` (QAS). Read access still works on every profile.
+
 ## Testing your install
 
 The `node test.mjs` / `node test.mjs --live` steps above are the self-check
@@ -61,17 +98,21 @@ details and credentials live in `.env` (gitignored); `server.js` contains no
 real hostnames. Never commit or share `.env` — sharing a service account breaks
 the SE24/transport audit trail and usually violates license terms.
 
-Fill in `HOST`, `CLIENT`, `USER` and `PASS` for each profile in `.env`:
+Fill in `HOST`, `CLIENT`, `USER` and `PASS` for each profile in `.env`. Every
+`SAP_<KEY>_HOST` you define becomes a switchable profile named `<KEY>` — the
+list below is illustrative, not fixed, so add or rename systems freely:
 
 | Profile  | Role                     |
 |----------|--------------------------|
 | `ABLD`   | Development              |
 | `dev120` | Development (client 120) |
 | `snet`   | QA/Test                  |
+| `ABLQ`   | QAS (read-only)          |
 | `ABLP`   | Production               |
 | `snet2`  | S/4HANA on-prem          |
 
-Writes to `ABLP` (production) are blocked in `server.js`; read access is allowed.
+Writes to `ABLP` (production) and `ABLQ` (QAS) are blocked in `server.js`; read
+access is allowed on every profile.
 
 ## Disclaimer
 
