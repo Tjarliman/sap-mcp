@@ -15,40 +15,51 @@ try {
   // No .env present - fall back to the ambient environment.
 }
 
-// Reads SAP_<PROFILE>_USER / SAP_<PROFILE>_PASS, e.g. SAP_ABLD_USER.
-function cred(key) {
-  const k = key.toUpperCase();
-  return { user: process.env[`SAP_${k}_USER`], pass: process.env[`SAP_${k}_PASS`] };
-}
-
-// Connection details (host + client) are not written into this file so it can
-// be published without exposing infrastructure. They live in .env next to the
-// credentials. Per profile: SAP_<KEY>_HOST, SAP_<KEY>_CLIENT, SAP_<KEY>_USER,
-// SAP_<KEY>_PASS. Only the human-readable label stays here.
-function conn(key, label) {
-  const k = key.toUpperCase();
-  return {
-    label,
-    host: process.env[`SAP_${k}_HOST`],
-    client: process.env[`SAP_${k}_CLIENT`],
-    ...cred(key),
-  };
-}
-
-const PROFILES = {
-  "ABLD":   conn("ABLD",   "Development"),
-  "dev120": conn("dev120", "Development (client 120)"),
-  "snet":   conn("snet",   "QA/Test"),
-  "ABLP":   conn("ABLP",   "Production"),
-  "snet2":  conn("snet2",  "S/4HANA on-prem"),
-  // To add a profile: add an entry here, then set SAP_<NAME>_HOST,
-  // SAP_<NAME>_CLIENT, SAP_<NAME>_USER and SAP_<NAME>_PASS in .env.
+// Profiles are DISCOVERED from .env: every SAP_<KEY>_HOST defines a profile
+// named <KEY>, with matching SAP_<KEY>_CLIENT / _USER / _PASS. Add or edit a
+// profile by editing .env - no code change needed. Optional friendly labels:
+const PROFILE_LABELS = {
+  ABLD: "Development",
+  DEV120: "Development (client 120)",
+  SNET: "QA/Test",
+  ABLQ: "QA/Test - Q01 (client 200)",
+  ABLP: "Production",
+  SNET2: "S/4HANA on-prem",
 };
 
-let activeProfile = "ABLD";
+function discoverProfiles() {
+  const out = {};
+  for (const name of Object.keys(process.env)) {
+    const m = /^SAP_(.+)_HOST$/.exec(name);
+    if (!m) continue;
+    const key = m[1];
+    out[key] = {
+      label: PROFILE_LABELS[key] || key,
+      host: process.env[`SAP_${key}_HOST`],
+      client: process.env[`SAP_${key}_CLIENT`],
+      user: process.env[`SAP_${key}_USER`],
+      pass: process.env[`SAP_${key}_PASS`],
+    };
+  }
+  return out;
+}
 
-// Profiles that must never be written to, whatever the caller asks for.
-const WRITE_BLOCKED_PROFILES = new Set(["ABLP"]);
+const PROFILES = discoverProfiles();
+
+// Resolve a profile name case-insensitively (so "snet" still matches "SNET").
+function resolveProfileKey(name) {
+  if (PROFILES[name]) return name;
+  const lower = String(name || "").toLowerCase();
+  return Object.keys(PROFILES).find((k) => k.toLowerCase() === lower) || null;
+}
+
+let activeProfile = PROFILES.ABLD ? "ABLD" : Object.keys(PROFILES)[0] || "ABLD";
+
+// Profiles that must never be written to (matched case-insensitively).
+const WRITE_BLOCKED_PROFILES = new Set(["ABLP", "ABLQ"]);
+function isWriteBlocked(key) {
+  return WRITE_BLOCKED_PROFILES.has(String(key || "").toUpperCase());
+}
 
 function profile() {
   const p = PROFILES[activeProfile];
@@ -70,7 +81,7 @@ function profile() {
 }
 
 function assertWritable() {
-  if (WRITE_BLOCKED_PROFILES.has(activeProfile)) {
+  if (isWriteBlocked(activeProfile)) {
     const p = PROFILES[activeProfile];
     throw new Error(
       `Writes are blocked on profile "${activeProfile}" (${p.label}, client ${p.client}). ` +
@@ -290,7 +301,7 @@ server.tool(
     const lines = Object.entries(PROFILES).map(([key, p]) => {
       const active = key === activeProfile ? " ◀ active" : "";
       const creds = p.user && p.pass ? "" : "  [NO CREDENTIALS - check .env]";
-      const ro = WRITE_BLOCKED_PROFILES.has(key) ? "  [read-only]" : "";
+      const ro = isWriteBlocked(key) ? "  [read-only]" : "";
       return `${key}: ${p.label} | ${p.host} | client ${p.client}${ro}${creds}${active}`;
     });
     return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -304,13 +315,14 @@ server.tool(
     profile: z.string().describe("Profile name to switch to, e.g. dev, prod"),
   },
   async ({ profile: name }) => {
-    if (!PROFILES[name]) {
+    const key = resolveProfileKey(name);
+    if (!key) {
       const available = Object.keys(PROFILES).join(", ");
       return { content: [{ type: "text", text: `Profile "${name}" not found. Available: ${available}` }] };
     }
-    activeProfile = name;
-    const p = PROFILES[name];
-    return { content: [{ type: "text", text: `Switched to profile "${name}": ${p.label} (${p.host}, client ${p.client})` }] };
+    activeProfile = key;
+    const p = PROFILES[key];
+    return { content: [{ type: "text", text: `Switched to profile "${key}": ${p.label} (${p.host}, client ${p.client})` }] };
   }
 );
 
@@ -386,7 +398,10 @@ server.tool(
     objectUri: z.string().describe("ADT URI of the object, e.g. /sap/bc/adt/programs/programs/zmyprogram"),
   },
   async ({ objectUri }) => {
-    const xml = await adtGet(objectUri);
+    // ADT source endpoints only serve text/plain; metadata endpoints serve XML.
+    // Without this a /source/main URI comes back as HTTP 406.
+    const accept = /\/source\/main\b/.test(objectUri) ? "text/plain" : undefined;
+    const xml = await adtGet(objectUri, accept);
     return { content: [{ type: "text", text: xml }] };
   }
 );
@@ -549,6 +564,104 @@ server.tool(
     // object is rejected by ADT ("... is currently editing ...").
     if (activate) {
       await runActivation(call, uri, name, log, "class");
+    }
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "create_program",
+  "Create a new classic ABAP program (executable report, type PROG/P) in SAP and activate it. " +
+  "Refuses to run on production profiles. Needs the full report source (REPORT ... / logic) and a " +
+  "transport request when the package is transportable (omit for $TMP local programs).",
+  {
+    programName: z.string().describe("Program name, e.g. ZHELLO_WORLD"),
+    description: z.string().describe("Short description shown in SE38/SE80"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway program."),
+    source: z.string().describe("Complete ABAP report source"),
+    transport: z.string().optional().describe("Transport request, e.g. ABLK900123. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ programName, description, packageName, source, transport: corrNr, activate }) => {
+    assertWritable();
+    if (!source || !source.trim()) throw new Error("Refusing to create a program with empty source.");
+
+    const name = programName.toUpperCase();
+    const uri = `/sap/bc/adt/programs/programs/${programName.toLowerCase()}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, text };
+    };
+
+    // 1) create the (empty) program shell
+    const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<program:abapProgram xmlns:program="http://www.sap.com/adt/programs/programs" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:name="${escapeXml(name)}" adtcore:type="PROG/P" ` +
+      `adtcore:description="${escapeXml(description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</program:abapProgram>`;
+
+    const created = await call(`/sap/bc/adt/programs/programs${corrQuery}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.sap.adt.programs.programs.v2+xml" },
+      body: shell,
+    });
+    if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+    log.push(`Created shell ${name} in package ${packageName.toUpperCase()}${corrNr ? ` on ${corrNr}` : ""}.`);
+
+    // 2) lock  3) put source  4) unlock — one stateful session
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written (${source.split("\n").length} lines).`);
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+        method: "POST",
+      });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    // Activate only after the edit lock is released.
+    if (activate) {
+      await runActivation(call, uri, name, log, "program");
     }
 
     return { content: [{ type: "text", text: log.join("\n") }] };
@@ -1101,6 +1214,137 @@ server.tool(
         }
       } else {
         log.push("Not activated (activate=false) - activate it in SE38/SE80.");
+      }
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+        method: "POST",
+      });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "patch_function_module",
+  "Modify PART of an existing ABAP function module. Function-module source lives inside a function group, " +
+  "so it must be locked/written through the fmodules URI - patch_program_source CANNOT do it (SAP rejects " +
+  "locking L<GROUP>U<nn> as R3TR PROG). Reads the current source, replaces oldString with newString (must " +
+  "match EXACTLY ONCE), then locks, PUTs, optionally activates, and unlocks. Refuses to run on production profiles. " +
+  "Look up the group first if unsure: SELECT FUNCNAME, PNAME FROM TFDIR - PNAME 'SAPLZFOO' means group 'ZFOO'.",
+  {
+    functionGroup: z.string().describe("Function group WITHOUT the SAPL prefix, e.g. ZABLMM_QCF_WF"),
+    functionModule: z.string().describe("Function module name, e.g. ZABLMM_QCF_WF_APPROVE"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request, e.g. D01K903896. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - activate in SE37 yourself."),
+  },
+  async ({ functionGroup, functionModule, oldString, newString, transport: corrNr, activate }) => {
+    assertWritable();
+
+    if (!oldString) throw new Error("oldString must not be empty.");
+    if (oldString === newString) throw new Error("oldString and newString are identical - nothing to do.");
+
+    const grp = functionGroup.replace(/^SAPL/i, "").toLowerCase();
+    const fm = functionModule.toLowerCase();
+    const name = functionModule.toUpperCase();
+    const uri = `/sap/bc/adt/functions/groups/${grp}/fmodules/${fm}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, text };
+    };
+
+    const probe = await call(`${uri}/source/main`, { method: "GET", accept: "text/plain" });
+    if (!probe.ok) {
+      throw new Error(
+        `Cannot read function module ${name} in group ${functionGroup.toUpperCase()} (${probe.status}). ` +
+        `Check the group name - PNAME in TFDIR is SAPL<GROUP>. ${probe.text.slice(0, 400)}`
+      );
+    }
+
+    // ADT hands source back with CRLF; callers naturally write LF.
+    const nl = s => String(s).replace(/\r\n/g, "\n");
+    let before = nl(probe.text);
+    oldString = nl(oldString);
+    newString = nl(newString);
+
+    const hits = before.split(oldString).length - 1;
+    if (hits === 0) {
+      const firstLine = oldString.split("\n")[0];
+      const near = before.split("\n").filter(l => firstLine.trim() && l.includes(firstLine.trim()));
+      throw new Error(
+        `oldString not found in ${name}. Nothing written.` +
+        (near.length ? ` Lines containing the first line of oldString: ${JSON.stringify(near.slice(0, 5))}` : "")
+      );
+    }
+    if (hits > 1) throw new Error(`oldString matched ${hits} times in ${name}. Nothing written. Add surrounding context to make it unique.`);
+    const after = before.replace(oldString, newString);
+
+    log.push(`Target: ${uri}`);
+    log.push(`Patched 1 occurrence. Lines ${before.split("\n").length} -> ${after.split("\n").length}.`);
+
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: after }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+
+      if (activate) {
+        const actBody =
+          `<?xml version="1.0" encoding="UTF-8"?>\n` +
+          `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+          `  <adtcore:objectReference adtcore:uri="${uri}" adtcore:name="${escapeXml(name)}"/>\n` +
+          `</adtcore:objectReferences>`;
+        const act = await call(`/sap/bc/adt/activation?method=activate&preauditRequests=false`, {
+          method: "POST",
+          headers: { "Content-Type": "application/xml" },
+          body: actBody,
+        });
+        const msgs = parseActivationMessages(act.text);
+        const bad = msgs.filter(m => /^[EAW]$/i.test(m.type));
+        if (!act.ok || bad.length) {
+          log.push(`ACTIVATION FAILED (HTTP ${act.status}) - source IS saved but the object is INACTIVE.`);
+          for (const m of (bad.length ? bad : msgs)) log.push(`  [${m.type}] ${m.text}`);
+          if (!bad.length) log.push(`  Raw response: ${(act.text || "(empty body)").slice(0, 1500)}`);
+        } else {
+          log.push("Activated cleanly.");
+        }
+      } else {
+        log.push("Not activated (activate=false) - activate it in SE37.");
       }
     } finally {
       const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
