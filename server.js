@@ -144,6 +144,15 @@ function escapeXml(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
+// Turns the escaped text inside XML attributes back into readable text.
+function decodeXml(s) {
+  return String(s ?? "")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&amp;/g, "&");
+}
+
 // Parses the <msg .../> list an activation returns. An empty body means success.
 function parseActivationMessages(xml) {
   if (!xml || !xml.trim()) return [];
@@ -250,6 +259,108 @@ async function createSourceObject({ name, uri, createEndpoint, contentType, shel
   }
 
   return log.join("\n");
+}
+
+// Shared edit flow for ADT text-source objects (class, BDEF, SRVD, function
+// module, ...). Reads the current source, applies `transform` to it, then
+// locks -> PUTs -> unlocks -> optionally activates. Activation MUST run after
+// unlock (see runActivation). Returns the log text.
+async function editSourceObject({ name, uri, transform, corrNr, activate, kind, createHint }) {
+  assertWritable();
+  const host = profile().host;
+  const log = [];
+
+  const { token, cookies: initialCookies } = await fetchCsrfToken();
+  let cookies = initialCookies;
+  if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+  const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+    const res = await fetch(`${host}${path}`, {
+      method,
+      headers: {
+        ...authHeaders(accept),
+        "X-CSRF-Token": token,
+        "x-sap-adt-sessiontype": "stateful",
+        Cookie: cookies,
+        ...headers,
+      },
+      body,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  };
+
+  // 1) read the current source (this tool edits; it never creates)
+  const probe = await call(`${uri}/source/main`, { method: "GET", accept: "text/plain" });
+  if (probe.status === 404) throw new Error(`${kind} ${name} not found. Use ${createHint} to create a new one.`);
+  if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+
+  // 2) work out the new source - transform() throws if the edit is unsafe
+  const before = String(probe.text).replace(/\r\n/g, "\n");
+  const after = transform(before, log);
+  log.push(`Target: ${uri}`);
+  log.push(`Lines ${before.split("\n").length} -> ${after.split("\n").length}.`);
+
+  // 3) lock  4) put source  5) unlock — all on the one stateful session
+  const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+    method: "POST",
+    accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+  });
+  if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+  const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+  if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+  log.push("Locked.");
+
+  let wrote = false;
+  try {
+    const put = await call(
+      `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
+      (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+      { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: after }
+    );
+    if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+    log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+    wrote = true;
+  } finally {
+    const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+      method: "POST",
+    });
+    log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+  }
+
+  if (wrote && activate) await runActivation(call, uri, name, log, kind);
+  else if (wrote) log.push(`Not activated (activate=false) - activate it yourself or with activate_object.`);
+
+  return log.join("\n");
+}
+
+// transform() for a whole-source overwrite.
+function wholeSource(source) {
+  if (!source || !source.trim()) throw new Error("Refusing to write an empty source - that would wipe the object.");
+  return () => String(source).replace(/\r\n/g, "\n");
+}
+
+// transform() for a surgical replace. Refuses on 0 or >1 matches so a bad edit
+// never half-writes the object.
+function replaceOnce(oldString, newString, name) {
+  if (!oldString) throw new Error("oldString must not be empty.");
+  if (oldString === newString) throw new Error("oldString and newString are identical - nothing to do.");
+  const nl = s => String(s).replace(/\r\n/g, "\n");
+  const oldNl = nl(oldString);
+  const newNl = nl(newString);
+  return (before, log) => {
+    const hits = before.split(oldNl).length - 1;
+    if (hits === 0) {
+      const firstLine = oldNl.split("\n")[0].trim();
+      const near = firstLine ? before.split("\n").filter(l => l.includes(firstLine)) : [];
+      throw new Error(`oldString not found in ${name}. Nothing written.` +
+        (near.length ? ` Lines containing the first line of oldString: ${JSON.stringify(near.slice(0, 5))}` : ""));
+    }
+    if (hits > 1) throw new Error(`oldString matched ${hits} times in ${name}. Nothing written. Add surrounding context to make it unique.`);
+    log.push("Patched 1 occurrence.");
+    return before.replace(oldNl, newNl);
+  };
 }
 
 function parseDataPreview(xml) {
@@ -398,9 +509,10 @@ server.tool(
     objectUri: z.string().describe("ADT URI of the object, e.g. /sap/bc/adt/programs/programs/zmyprogram"),
   },
   async ({ objectUri }) => {
-    // ADT source endpoints only serve text/plain; metadata endpoints serve XML.
-    // Without this a /source/main URI comes back as HTTP 406.
-    const accept = /\/source\/main\b/.test(objectUri) ? "text/plain" : undefined;
+    // ADT source endpoints only serve text/plain; metadata endpoints serve XML
+    // but reject a missing/narrow Accept with HTTP 406 (esp. DDIC domains,
+    // data elements, tables), so ask for */* there.
+    const accept = /\/source\/main\b/.test(objectUri) ? "text/plain" : "*/*";
     const xml = await adtGet(objectUri, accept);
     return { content: [{ type: "text", text: xml }] };
   }
@@ -924,6 +1036,511 @@ server.tool(
   }
 );
 
+// Shell-only create for ADT objects whose definition lives in XML rather than
+// a text source (domain, data element). Create -> optionally activate.
+async function createXmlObject({ name, uri, createEndpoint, contentType, shell, corrNr, activate, kind }) {
+  assertWritable();
+  const host = profile().host;
+  const log = [];
+
+  const { token, cookies: initialCookies } = await fetchCsrfToken();
+  let cookies = initialCookies;
+  if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+  const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+    const res = await fetch(`${host}${path}`, {
+      method,
+      headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+      body,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  };
+
+  const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+  const created = await call(`${createEndpoint}${corrQuery}`, {
+    method: "POST",
+    headers: { "Content-Type": contentType },
+    body: shell,
+  });
+  if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+  log.push(`Created ${kind} ${name}${corrNr ? ` on ${corrNr}` : ""}.`);
+
+  if (activate) await runActivation(call, uri, name, log, kind);
+  else log.push("Not activated (activate=false) - activate it with activate_object.");
+
+  return log.join("\n");
+}
+
+// --- structures (TABL/DS) - DDL source, same shape as tables ---------------
+
+const structureUri = n => `/sap/bc/adt/ddic/structures/${n.toLowerCase()}`;
+
+server.tool(
+  "create_structure",
+  "Create a new DDIC structure (TABL/DS) from DDL source and optionally activate it. Refuses to run on " +
+  "production profiles. Source looks like: define structure zst_foo { field : abap.char(10); }",
+  {
+    structureName: z.string().describe("Structure name, e.g. ZST_PLANT_EMAIL"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete DDL source (define structure <name> { ... })"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ structureName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = structureName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<blue:blueSource xmlns:blue="http://www.sap.com/wbobj/blue" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="TABL/DS" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</blue:blueSource>`;
+    const text = await createSourceObject({
+      name, uri: structureUri(structureName),
+      createEndpoint: "/sap/bc/adt/ddic/structures",
+      contentType: "application/vnd.sap.adt.structures.v2+xml",
+      shell, source, corrNr, activate, kind: "structure",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_structure",
+  "Overwrite the DDL source of an EXISTING DDIC structure. REPLACES the whole definition - read it first and " +
+  "send the complete result back. Refuses to run on production profiles. Prefer patch_structure for small edits.",
+  {
+    structureName: z.string().describe("Structure name, e.g. ZST_PLANT_EMAIL"),
+    source: z.string().describe("Complete new DDL source - REPLACES the entire structure"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - a structure change may affect users of it."),
+  },
+  async ({ structureName, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: structureName.toUpperCase(), uri: structureUri(structureName),
+      transform: wholeSource(source), corrNr, activate, kind: "structure", createHint: "create_structure",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_structure",
+  "Modify PART of an existing DDIC structure's DDL (e.g. add one field). Replaces oldString with newString " +
+  "(must match EXACTLY ONCE). Refuses to run on production profiles.",
+  {
+    structureName: z.string().describe("Structure name, e.g. ZST_PLANT_EMAIL"),
+    oldString: z.string().describe("Exact existing DDL text to replace. Must occur exactly once."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ structureName, oldString, newString, transport: corrNr, activate }) => {
+    const name = structureName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: structureUri(structureName),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate, kind: "structure", createHint: "create_structure",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// --- interfaces (INTF/OI) - ABAP source, same shape as classes -------------
+
+const interfaceUri = n => `/sap/bc/adt/oo/interfaces/${n.toLowerCase()}`;
+
+server.tool(
+  "create_interface",
+  "Create a new ABAP interface and optionally activate it. Refuses to run on production profiles. Needs the " +
+  "full source (INTERFACE <name> PUBLIC. ... ENDINTERFACE.).",
+  {
+    interfaceName: z.string().describe("Interface name, e.g. ZIF_ABL_PLANT_EMAIL"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete ABAP source of the interface"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ interfaceName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = interfaceName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<intf:abapInterface xmlns:intf="http://www.sap.com/adt/oo/interfaces" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:name="${escapeXml(name)}" adtcore:type="INTF/OI" ` +
+      `adtcore:description="${escapeXml(description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</intf:abapInterface>`;
+    const text = await createSourceObject({
+      name, uri: interfaceUri(interfaceName),
+      createEndpoint: "/sap/bc/adt/oo/interfaces",
+      contentType: "application/vnd.sap.adt.oo.interfaces.v5+xml",
+      shell, source, corrNr, activate, kind: "interface",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_interface",
+  "Overwrite the source of an EXISTING ABAP interface. REPLACES the whole interface - read it first and send " +
+  "the complete result back. Refuses to run on production profiles. Prefer patch_interface for small edits.",
+  {
+    interfaceName: z.string().describe("Interface name, e.g. ZIF_ABL_PLANT_EMAIL"),
+    source: z.string().describe("Complete new ABAP source - REPLACES the entire interface"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ interfaceName, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: interfaceName.toUpperCase(), uri: interfaceUri(interfaceName),
+      transform: wholeSource(source), corrNr, activate, kind: "interface", createHint: "create_interface",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_interface",
+  "Modify PART of an existing ABAP interface (e.g. add one method signature). Replaces oldString with " +
+  "newString (must match EXACTLY ONCE). Refuses to run on production profiles.",
+  {
+    interfaceName: z.string().describe("Interface name, e.g. ZIF_ABL_PLANT_EMAIL"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ interfaceName, oldString, newString, transport: corrNr, activate }) => {
+    const name = interfaceName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: interfaceUri(interfaceName),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate, kind: "interface", createHint: "create_interface",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// --- metadata extensions (DDLX/EX) - UI annotations for a CDS view ---------
+
+const ddlxUri = n => `/sap/bc/adt/ddic/ddlx/sources/${n.toLowerCase()}`;
+
+server.tool(
+  "create_ddlx",
+  "Create a new CDS metadata extension (DDLX) - the object that carries UI annotations for a CDS view, which a " +
+  "Fiori Elements app needs. Refuses to run on production profiles. Source looks like: " +
+  "@Metadata.layer: #CORE annotate view ZI_FOO with { @UI.lineItem: [{position: 10}] field; }",
+  {
+    ddlxName: z.string().describe("Metadata extension name, e.g. ZTJI_PLANT_EMAIL_MDE"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete DDLX source (@Metadata.layer: ... annotate view ... with { ... })"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ ddlxName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = ddlxName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<ddlx:ddlxSource xmlns:ddlx="http://www.sap.com/adt/ddic/ddlxsources" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="DDLX/EX" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</ddlx:ddlxSource>`;
+    const text = await createSourceObject({
+      name, uri: ddlxUri(ddlxName),
+      createEndpoint: "/sap/bc/adt/ddic/ddlx/sources",
+      contentType: "application/vnd.sap.adt.ddic.ddlx.v1+xml",
+      shell, source, corrNr, activate, kind: "metadata extension",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_ddlx",
+  "Overwrite the source of an EXISTING CDS metadata extension (DDLX). REPLACES the whole source. Refuses to " +
+  "run on production profiles. Prefer patch_ddlx for small edits.",
+  {
+    ddlxName: z.string().describe("Metadata extension name"),
+    source: z.string().describe("Complete new DDLX source - REPLACES the entire object"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ ddlxName, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: ddlxName.toUpperCase(), uri: ddlxUri(ddlxName),
+      transform: wholeSource(source), corrNr, activate, kind: "metadata extension", createHint: "create_ddlx",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_ddlx",
+  "Modify PART of an existing CDS metadata extension (e.g. add one @UI annotation). Replaces oldString with " +
+  "newString (must match EXACTLY ONCE). Refuses to run on production profiles.",
+  {
+    ddlxName: z.string().describe("Metadata extension name"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ ddlxName, oldString, newString, transport: corrNr, activate }) => {
+    const name = ddlxName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: ddlxUri(ddlxName),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate, kind: "metadata extension", createHint: "create_ddlx",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// --- domains + data elements (XML-defined, no text source) -----------------
+
+// ADT writes DDIC lengths as zero-padded 6-digit strings.
+const pad6 = n => String(Math.max(0, parseInt(n, 10) || 0)).padStart(6, "0");
+
+server.tool(
+  "create_domain",
+  "Create a new DDIC domain (DOMA/DD) and optionally activate it. A domain defines the technical type " +
+  "(datatype/length/decimals) and optional fixed values. Refuses to run on production profiles.",
+  {
+    domainName: z.string().describe("Domain name, e.g. ZDOM_PLANT"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    datatype: z.string().describe("DDIC data type, e.g. CHAR, NUMC, DEC, DATS, TIMS, INT4, STRING"),
+    length: z.number().describe("Field length, e.g. 10"),
+    decimals: z.number().optional().default(0).describe("Decimal places (for DEC/QUAN/CURR)"),
+    lowercase: z.boolean().optional().default(false).describe("Allow lower case"),
+    fixedValues: z.array(z.object({ value: z.string(), description: z.string() })).optional()
+      .describe("Optional fixed value list, e.g. [{value:'X',description:'Yes'}]"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after creating"),
+  },
+  async ({ domainName, description, packageName, datatype, length, decimals, lowercase, fixedValues, transport: corrNr, activate }) => {
+    const name = domainName.toUpperCase();
+    const fixed = (fixedValues || []).length
+      ? `<doma:fixValues>` + fixedValues.map(v =>
+          `<doma:fixValue><doma:low>${escapeXml(v.value)}</doma:low><doma:description>${escapeXml(v.description)}</doma:description></doma:fixValue>`
+        ).join("") + `</doma:fixValues>`
+      : `<doma:fixValues/>`;
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<doma:domain xmlns:doma="http://www.sap.com/dictionary/domain" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:name="${escapeXml(name)}" adtcore:type="DOMA/DD" ` +
+      `adtcore:description="${escapeXml(description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN">` +
+      `<adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>` +
+      `<doma:content>` +
+      `<doma:typeInformation><doma:datatype>${escapeXml(datatype.toUpperCase())}</doma:datatype>` +
+      `<doma:length>${pad6(length)}</doma:length><doma:decimals>${pad6(decimals)}</doma:decimals></doma:typeInformation>` +
+      `<doma:outputInformation><doma:length>${pad6(length)}</doma:length><doma:style>00</doma:style>` +
+      `<doma:conversionExit/><doma:signExists>false</doma:signExists>` +
+      `<doma:lowercase>${lowercase ? "true" : "false"}</doma:lowercase><doma:ampmFormat>false</doma:ampmFormat></doma:outputInformation>` +
+      `<doma:valueInformation><doma:appendExists>false</doma:appendExists>${fixed}</doma:valueInformation>` +
+      `</doma:content></doma:domain>`;
+    const text = await createXmlObject({
+      name, uri: `/sap/bc/adt/ddic/domains/${domainName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/ddic/domains",
+      contentType: "application/vnd.sap.adt.domains.v2+xml",
+      shell, corrNr, activate, kind: "domain",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "create_data_element",
+  "Create a new DDIC data element (DTEL/DE) and optionally activate it. Either point it at a domain " +
+  "(typeKind='domain', typeName=<domain>) or give a built-in type (typeKind='predefinedAbapType' with " +
+  "dataType/length). Field labels are what users see on screens. Refuses to run on production profiles.",
+  {
+    dataElementName: z.string().describe("Data element name, e.g. ZDE_PLANT"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    typeKind: z.enum(["domain", "predefinedAbapType"]).optional().default("domain")
+      .describe("'domain' to reference a domain, or 'predefinedAbapType' for a built-in type"),
+    typeName: z.string().optional().describe("Domain name when typeKind='domain', e.g. ZDOM_PLANT"),
+    dataType: z.string().optional().describe("DDIC type when typeKind='predefinedAbapType', e.g. CHAR"),
+    length: z.number().optional().describe("Length when typeKind='predefinedAbapType'"),
+    decimals: z.number().optional().default(0).describe("Decimals when typeKind='predefinedAbapType'"),
+    shortLabel: z.string().optional().describe("Short field label (max 10 chars)"),
+    mediumLabel: z.string().optional().describe("Medium field label (max 20 chars)"),
+    longLabel: z.string().optional().describe("Long field label (max 40 chars)"),
+    headingLabel: z.string().optional().describe("Heading field label (max 55 chars)"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after creating"),
+  },
+  async (a) => {
+    const name = a.dataElementName.toUpperCase();
+    if (a.typeKind === "domain" && !a.typeName) throw new Error("typeName (the domain) is required when typeKind='domain'.");
+    if (a.typeKind === "predefinedAbapType" && !a.dataType) throw new Error("dataType is required when typeKind='predefinedAbapType'.");
+
+    const short = a.shortLabel || a.description.slice(0, 10);
+    const medium = a.mediumLabel || a.description.slice(0, 20);
+    const long = a.longLabel || a.description.slice(0, 40);
+    const heading = a.headingLabel || short;
+
+    const typeBits = a.typeKind === "domain"
+      ? `<dtel:typeKind>domain</dtel:typeKind><dtel:typeName>${escapeXml(a.typeName.toUpperCase())}</dtel:typeName>`
+      : `<dtel:typeKind>predefinedAbapType</dtel:typeKind>` +
+        `<dtel:dataType>${escapeXml((a.dataType || "").toUpperCase())}</dtel:dataType>` +
+        `<dtel:dataTypeLength>${pad6(a.length)}</dtel:dataTypeLength>` +
+        `<dtel:dataTypeDecimals>${pad6(a.decimals)}</dtel:dataTypeDecimals>`;
+
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<blue:wbobj xmlns:blue="http://www.sap.com/wbobj/dictionary/dtel" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:name="${escapeXml(name)}" adtcore:type="DTEL/DE" ` +
+      `adtcore:description="${escapeXml(a.description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN">` +
+      `<adtcore:packageRef adtcore:name="${escapeXml(a.packageName.toUpperCase())}"/>` +
+      `<dtel:dataElement xmlns:dtel="http://www.sap.com/adt/dictionary/dataelements">` +
+      typeBits +
+      `<dtel:shortFieldLabel>${escapeXml(short)}</dtel:shortFieldLabel><dtel:shortFieldLength>${short.length}</dtel:shortFieldLength>` +
+      `<dtel:mediumFieldLabel>${escapeXml(medium)}</dtel:mediumFieldLabel><dtel:mediumFieldLength>${medium.length}</dtel:mediumFieldLength>` +
+      `<dtel:longFieldLabel>${escapeXml(long)}</dtel:longFieldLabel><dtel:longFieldLength>${long.length}</dtel:longFieldLength>` +
+      `<dtel:headingFieldLabel>${escapeXml(heading)}</dtel:headingFieldLabel><dtel:headingFieldLength>${heading.length}</dtel:headingFieldLength>` +
+      `</dtel:dataElement></blue:wbobj>`;
+
+    const text = await createXmlObject({
+      name, uri: `/sap/bc/adt/ddic/dataelements/${a.dataElementName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/ddic/dataelements",
+      contentType: "application/vnd.sap.adt.dataelements.v2+xml",
+      shell, corrNr: a.transport, activate: a.activate, kind: "data element",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// --- transports -----------------------------------------------------------
+
+server.tool(
+  "list_transports",
+  "List transport requests for a user (default: the profile's own user). Read-only and safe on any profile. " +
+  "Use it to find an open request number to pass as `transport` to the create/update tools.",
+  {
+    user: z.string().optional().describe("SAP user name. Defaults to the current profile's user."),
+    status: z.enum(["modifiable", "released", "all"]).optional().default("modifiable")
+      .describe("Which requests to return. 'modifiable' = still open."),
+  },
+  async ({ user, status }) => {
+    const p = profile();
+    const who = (user || p.user || "").toUpperCase();
+    const trstatus = status === "released" ? "R" : status === "all" ? "" : "D";
+    const path = `/sap/bc/adt/cts/transportrequests?_action=FIND&trfunction=K` +
+      (trstatus ? `&trstatus=${trstatus}` : "") + `&user=${encodeURIComponent(who)}`;
+    const xml = await adtGet(path, "*/*");
+
+    // SAP returns both the modifiable and released sections regardless of the
+    // trstatus filter, so filter on each request's own status here.
+    const all = [...xml.matchAll(/<tm:request\b([^>]*)>/g)].map(m => {
+      const a = m[1];
+      const g = (k) => (a.match(new RegExp(`tm:${k}="([^"]*)"`)) || [])[1] || "";
+      return { number: g("number"), desc: decodeXml(g("desc")), owner: g("owner"), status: g("status"), type: g("type") };
+    }).filter(r => r.number);
+
+    const rows = status === "all" ? all
+      : status === "released" ? all.filter(r => r.status === "R")
+      : all.filter(r => r.status !== "R"); // modifiable = anything not released
+
+    if (!rows.length) {
+      const hint = status === "modifiable" && all.length
+        ? ` (${all.length} released request(s) exist - pass status:"all" to see them)` : "";
+      return { content: [{ type: "text", text: `No ${status} transport requests found for ${who}.${hint}` }] };
+    }
+    const label = s => (s === "R" ? "released" : s === "D" ? "modifiable" : s || "?");
+    const lines = rows.map(r => `${r.number}  [${label(r.status)}]  ${r.desc}${r.owner && r.owner !== who ? `  (owner ${r.owner})` : ""}`);
+    return { content: [{ type: "text", text: `Transport requests for ${who} (${status}):\n` + lines.join("\n") }] };
+  }
+);
+
+server.tool(
+  "syntax_check",
+  "Run the ABAP syntax/consistency check (the same check ADT runs) on an existing object WITHOUT activating " +
+  "it. Read-only and safe on any profile, including production. Use this after writing source and BEFORE " +
+  "activate_object - it reports errors and warnings so you can fix them first. To check source you have just " +
+  "written but not yet activated, pass version=\"inactive\".",
+  {
+    objectUri: z.string().describe("ADT URI of the object, e.g. /sap/bc/adt/oo/classes/zcl_foo or /sap/bc/adt/ddic/ddl/sources/zi_foo (with or without /source/main)"),
+    version: z.enum(["active", "inactive"]).optional().default("active")
+      .describe("Which version to check. Use 'inactive' for source that is saved but not yet activated."),
+  },
+  async ({ objectUri, version }) => {
+    const host = profile().host;
+    // Normalise: the check runs against the object's source URI.
+    const base = String(objectUri).replace(/\/source\/main\b.*$/, "").replace(/\/+$/, "");
+    const sourceUri = `${base}/source/main`;
+
+    const { token, cookies } = await fetchCsrfToken();
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<chkrun:checkObjectList xmlns:chkrun="http://www.sap.com/adt/checkrun" xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+      `  <chkrun:checkObject adtcore:uri="${escapeXml(sourceUri)}" chkrun:version="${version}"/>\n` +
+      `</chkrun:checkObjectList>`;
+
+    const res = await fetch(`${host}/sap/bc/adt/checkruns?reporters=abapCheckRun`, {
+      method: "POST",
+      headers: {
+        ...authHeaders("application/vnd.sap.adt.checkmessages+xml"),
+        "X-CSRF-Token": token,
+        Cookie: cookies,
+        "Content-Type": "application/vnd.sap.adt.checkobjects+xml",
+      },
+      body,
+      agent,
+    });
+    const xml = await res.text();
+    if (!res.ok) throw new Error(`Syntax check failed (${res.status}). ${xml}`);
+
+    const status = (xml.match(/chkrun:status="([^"]*)"/) || [])[1] || "";
+    const statusText = (xml.match(/chkrun:statusText="([^"]*)"/) || [])[1] || "";
+    const log = [`Object: ${base}  (version: ${version})`];
+
+    if (status === "notProcessed") {
+      log.push(`NOT CHECKED: ${statusText || "object could not be checked"}`);
+      return { content: [{ type: "text", text: log.join("\n") }] };
+    }
+
+    // Each finding is a chkrun:checkMessage with a type (E/W/I) and short text.
+    const messages = [...xml.matchAll(/<chkrun:checkMessage\b([^>]*)\/?>/g)].map(m => {
+      const attrs = m[1];
+      const get = (a) => (attrs.match(new RegExp(`chkrun:${a}="([^"]*)"`)) || [])[1] || "";
+      return { type: get("type"), text: get("shortText"), uri: get("uri") };
+    });
+
+    const errors = messages.filter(m => /^E/i.test(m.type));
+    const warnings = messages.filter(m => /^W/i.test(m.type));
+    const others = messages.filter(m => !/^[EW]/i.test(m.type));
+
+    if (!messages.length) {
+      log.push(`OK - no syntax errors. ${statusText}`);
+    } else {
+      log.push(`${errors.length} error(s), ${warnings.length} warning(s), ${others.length} other.`);
+      for (const m of [...errors, ...warnings, ...others]) {
+        log.push(`  [${m.type || "?"}] ${decodeXml(m.text)}${m.uri ? `  (${m.uri})` : ""}`);
+      }
+    }
+    // If the report says something is wrong but no messages parsed, never hide it.
+    if (!messages.length && status && status !== "processed") {
+      log.push(`Unparsed report (status="${status}"). Raw response:\n${xml.slice(0, 1500)}`);
+    }
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
 server.tool(
   "activate_object",
   "Activate one or more existing ABAP objects and report the raw activation result. " +
@@ -1385,6 +2002,460 @@ server.tool(
     else if (wrote) log.push("Not activated (activate=false) - review and activate in SE11.");
 
     return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "create_function_group",
+  "Create a new function group (the container that holds function modules). Refuses to run on production " +
+  "profiles. Add modules afterwards with create_function_module. Needs a transport unless package is $TMP.",
+  {
+    functionGroup: z.string().describe("Function group name WITHOUT the SAPL prefix, e.g. ZABL_UTIL"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+  },
+  async ({ functionGroup, description, packageName, transport: corrNr }) => {
+    assertWritable();
+    const name = functionGroup.toUpperCase();
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<group:abapFunctionGroup xmlns:group="http://www.sap.com/adt/functions/groups" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="FUGR/F" adtcore:masterLanguage="EN" adtcore:language="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</group:abapFunctionGroup>`;
+
+    const created = await call(`/sap/bc/adt/functions/groups${corrQuery}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.sap.adt.functions.groups.v3+xml" },
+      body: shell,
+    });
+    if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+    log.push(`Created function group ${name} in package ${packageName.toUpperCase()}${corrNr ? ` on ${corrNr}` : ""}.`);
+    log.push("Add function modules with create_function_module.");
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "create_function_module",
+  "Create a new function module inside an EXISTING function group, write its source, and optionally activate. " +
+  "Refuses to run on production profiles. Create the group first with create_function_group. Provide the full " +
+  "source/main text (FUNCTION <name>. ... ENDFUNCTION.).",
+  {
+    functionGroup: z.string().describe("Function group name WITHOUT the SAPL prefix, e.g. ZABL_UTIL"),
+    functionModule: z.string().describe("Function module name, e.g. Z_ABL_DO_THING"),
+    description: z.string().describe("Short description"),
+    source: z.string().describe("Complete FM source as ADT stores it (FUNCTION ... ENDFUNCTION.)"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - activate in SE37/SE80."),
+  },
+  async ({ functionGroup, functionModule, description, source, transport: corrNr, activate }) => {
+    assertWritable();
+    if (!source || !source.trim()) throw new Error("Refusing to create a function module with empty source.");
+
+    const grp = functionGroup.toLowerCase();
+    const fm = functionModule.toLowerCase();
+    const name = functionModule.toUpperCase();
+    const uri = `/sap/bc/adt/functions/groups/${grp}/fmodules/${fm}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<fmodule:abapFunctionModule xmlns:fmodule="http://www.sap.com/adt/functions/fmodules" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="FUGR/FF" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:containerRef adtcore:name="${escapeXml(functionGroup.toUpperCase())}" adtcore:type="FUGR/F" ` +
+      `adtcore:uri="/sap/bc/adt/functions/groups/${grp}"/>\n` +
+      `</fmodule:abapFunctionModule>`;
+
+    const created = await call(`/sap/bc/adt/functions/groups/${grp}/fmodules${corrQuery}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/vnd.sap.adt.functions.fmodules.v3+xml" },
+      body: shell,
+    });
+    if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+    log.push(`Created function module ${name} in group ${functionGroup.toUpperCase()}.`);
+
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    let wrote = false;
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    if (wrote && activate) await runActivation(call, uri, name, log, "function module");
+    else if (wrote) log.push("Not activated (activate=false) - activate in SE37/SE80.");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "update_cds",
+  "Overwrite the source of an EXISTING CDS view (DDLS). Locks, PUTs the whole new DDL source, unlocks, then " +
+  "optionally activates. Refuses to run on production profiles. IMPORTANT: this REPLACES the whole CDS source - " +
+  "read it first, edit that text, and send the complete result back. Keep the entity name unchanged. Prefer " +
+  "patch_cds for small edits.",
+  {
+    cdsName: z.string().describe("CDS entity/DDLS name, e.g. ZKIT_I_PRODUCT"),
+    source: z.string().describe("Complete new CDS DDL source - REPLACES the entire definition"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - CDS activation is safe (no DB conversion); pass true to activate in one call."),
+  },
+  async ({ cdsName, source, transport: corrNr, activate }) => {
+    assertWritable();
+    if (!source || !source.trim()) throw new Error("Refusing to write an empty source - that would wipe the CDS view.");
+
+    const name = cdsName.toUpperCase();
+    const uri = `/sap/bc/adt/ddic/ddl/sources/${cdsName.toLowerCase()}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const probe = await call(`${uri}/source/main`, { method: "GET", accept: "text/plain" });
+    if (probe.status === 404) throw new Error(`CDS view ${name} not found. Use create_cds to create a new one.`);
+    if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+    log.push(`Target: ${uri}`);
+    log.push(`Current size: ${probe.text.split("\n").length} lines -> new: ${source.split("\n").length} lines.`);
+
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    let wrote = false;
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    if (wrote && activate) await runActivation(call, uri, name, log, "CDS view");
+    else if (wrote) log.push("Not activated (activate=false) - activate in the CDS editor or with activate_object.");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "patch_cds",
+  "Modify PART of an existing CDS view's DDL without resending the whole source. Reads the current source, " +
+  "replaces oldString with newString (must match EXACTLY ONCE), then locks, PUTs, unlocks, and optionally " +
+  "activates. Prefer this over update_cds for small edits like adding a field or annotation. Refuses to run on " +
+  "production profiles.",
+  {
+    cdsName: z.string().describe("CDS entity/DDLS name, e.g. ZKIT_I_PRODUCT"),
+    oldString: z.string().describe("Exact existing DDL text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - CDS activation is safe; pass true to activate in one call."),
+  },
+  async ({ cdsName, oldString, newString, transport: corrNr, activate }) => {
+    assertWritable();
+    if (!oldString) throw new Error("oldString must not be empty.");
+    if (oldString === newString) throw new Error("oldString and newString are identical - nothing to do.");
+
+    const name = cdsName.toUpperCase();
+    const uri = `/sap/bc/adt/ddic/ddl/sources/${cdsName.toLowerCase()}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const probe = await call(`${uri}/source/main`, { method: "GET", accept: "text/plain" });
+    if (probe.status === 404) throw new Error(`CDS view ${name} not found. Use create_cds to create a new one.`);
+    if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+
+    const nl = s => String(s).replace(/\r\n/g, "\n");
+    const before = nl(probe.text);
+    oldString = nl(oldString);
+    newString = nl(newString);
+
+    const hits = before.split(oldString).length - 1;
+    if (hits === 0) {
+      const firstLine = oldString.split("\n")[0];
+      const near = before.split("\n").filter(l => l.includes(firstLine.trim()) && firstLine.trim());
+      throw new Error(`oldString not found in ${name}. Nothing written.` + (near.length ? ` Lines containing the first line of oldString: ${JSON.stringify(near.slice(0, 5))}` : ""));
+    }
+    if (hits > 1) throw new Error(`oldString matched ${hits} times in ${name}. Nothing written. Add surrounding context to make it unique.`);
+    const after = before.replace(oldString, newString);
+
+    log.push(`Target: ${uri}`);
+    log.push(`Patched 1 occurrence. Lines ${before.split("\n").length} -> ${after.split("\n").length}.`);
+
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    let wrote = false;
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: after }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    if (wrote && activate) await runActivation(call, uri, name, log, "CDS view");
+    else if (wrote) log.push("Not activated (activate=false) - activate in the CDS editor or with activate_object.");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+// --- source editors for class / BDEF / SRVD / function module --------------
+// All share editSourceObject: read -> transform -> lock -> PUT -> unlock -> activate.
+
+const classUri = n => `/sap/bc/adt/oo/classes/${n.toLowerCase()}`;
+const bdefUri = n => `/sap/bc/adt/bo/behaviordefinitions/${n.toLowerCase()}`;
+const srvdUri = n => `/sap/bc/adt/ddic/srvd/sources/${n.toLowerCase()}`;
+
+server.tool(
+  "update_class",
+  "Overwrite the source of an EXISTING ABAP class. Locks, PUTs the whole new source, unlocks, then optionally " +
+  "activates. Refuses to run on production profiles. IMPORTANT: this REPLACES the whole class - read it first " +
+  "with get_object_info (.../source/main), edit that text, and send the complete result back (both the " +
+  "DEFINITION and IMPLEMENTATION parts). Prefer patch_class for small edits.",
+  {
+    className: z.string().describe("Class name, e.g. ZCL_ABL_PLANT_EMAIL"),
+    source: z.string().describe("Complete new ABAP source - REPLACES the entire class"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - activate in SE24/ADT."),
+  },
+  async ({ className, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: className.toUpperCase(), uri: classUri(className),
+      transform: wholeSource(source), corrNr, activate, kind: "class", createHint: "create_class",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_class",
+  "Modify PART of an existing ABAP class without resending the whole source. Reads the current source, replaces " +
+  "oldString with newString (must match EXACTLY ONCE), then locks, PUTs, unlocks, and optionally activates. " +
+  "Prefer this over update_class for small edits like changing one method body. Refuses to run on production profiles.",
+  {
+    className: z.string().describe("Class name, e.g. ZCL_ABL_PLANT_EMAIL"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ className, oldString, newString, transport: corrNr, activate }) => {
+    const name = className.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: classUri(className),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate, kind: "class", createHint: "create_class",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_bdef",
+  "Overwrite the source of an EXISTING behavior definition (BDEF). Locks, PUTs the whole new source, unlocks, " +
+  "then optionally activates. Refuses to run on production profiles. REPLACES the whole BDEF - read it first, " +
+  "edit that text, and send the complete result back. Prefer patch_bdef for small edits.",
+  {
+    bdefName: z.string().describe("Behavior definition name = its root entity, e.g. ZTJI_PLANT_EMAIL"),
+    source: z.string().describe("Complete new BDEF source - REPLACES the entire definition"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ bdefName, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: bdefName.toUpperCase(), uri: bdefUri(bdefName),
+      transform: wholeSource(source), corrNr, activate, kind: "behavior definition", createHint: "create_bdef",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_bdef",
+  "Modify PART of an existing behavior definition (BDEF) without resending the whole source. Reads the current " +
+  "source, replaces oldString with newString (must match EXACTLY ONCE), then locks, PUTs, unlocks, and " +
+  "optionally activates. Refuses to run on production profiles.",
+  {
+    bdefName: z.string().describe("Behavior definition name = its root entity, e.g. ZTJI_PLANT_EMAIL"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ bdefName, oldString, newString, transport: corrNr, activate }) => {
+    const name = bdefName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: bdefUri(bdefName),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate, kind: "behavior definition", createHint: "create_bdef",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_srvd",
+  "Overwrite the source of an EXISTING service definition (SRVD). Locks, PUTs the whole new source, unlocks, " +
+  "then optionally activates. Refuses to run on production profiles. REPLACES the whole definition - read it " +
+  "first, edit that text, and send the complete result back. Prefer patch_srvd for small edits.",
+  {
+    srvdName: z.string().describe("Service definition name, e.g. ZTJ_UI_PLANT_EMAIL"),
+    source: z.string().describe("Complete new SRVD source - REPLACES the entire definition"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ srvdName, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: srvdName.toUpperCase(), uri: srvdUri(srvdName),
+      transform: wholeSource(source), corrNr, activate, kind: "service definition", createHint: "create_srvd",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_srvd",
+  "Modify PART of an existing service definition (SRVD) without resending the whole source - e.g. exposing one " +
+  "more entity. Reads the current source, replaces oldString with newString (must match EXACTLY ONCE), then " +
+  "locks, PUTs, unlocks, and optionally activates. Refuses to run on production profiles.",
+  {
+    srvdName: z.string().describe("Service definition name, e.g. ZTJ_UI_PLANT_EMAIL"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ srvdName, oldString, newString, transport: corrNr, activate }) => {
+    const name = srvdName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: srvdUri(srvdName),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate, kind: "service definition", createHint: "create_srvd",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_function_module",
+  "Overwrite the whole source of an EXISTING function module. Locks, PUTs, unlocks, then optionally activates. " +
+  "Refuses to run on production profiles. REPLACES the entire FM (FUNCTION ... ENDFUNCTION.) - read it first and " +
+  "send the complete result back. Prefer patch_function_module for small edits. Pass the group WITHOUT the SAPL prefix.",
+  {
+    functionGroup: z.string().describe("Function group WITHOUT the SAPL prefix, e.g. ZABLMM_QCF_WF"),
+    functionModule: z.string().describe("Function module name, e.g. ZABLMM_QCF_WF_APPROVE"),
+    source: z.string().describe("Complete new FM source - REPLACES the entire module"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - activate in SE37."),
+  },
+  async ({ functionGroup, functionModule, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: functionModule.toUpperCase(),
+      uri: `/sap/bc/adt/functions/groups/${functionGroup.toLowerCase()}/fmodules/${functionModule.toLowerCase()}`,
+      transform: wholeSource(source), corrNr, activate, kind: "function module", createHint: "create_function_module",
+    });
+    return { content: [{ type: "text", text }] };
   }
 );
 

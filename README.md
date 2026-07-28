@@ -71,6 +71,30 @@ To confirm the update loaded, start a fresh session and ask Claude to run
 
 ### What's new (2026-07)
 
+This release roughly doubles the toolset (25 → 45). **These are new tools, so you
+must fully quit and restart Claude Code after updating** (see the note above).
+
+- **Source editors for the objects that were create-only.** You could previously
+  create a class but never edit one — that's fixed:
+  `update_class` / `patch_class`, `update_bdef` / `patch_bdef`,
+  `update_srvd` / `patch_srvd`, `update_cds` / `patch_cds`,
+  `update_function_module`. Each locks → writes → unlocks and can activate;
+  the `patch_*` variants do a surgical exact-string replace and refuse to write
+  when the target text matches zero or more than one time.
+- **`syntax_check`** — run ADT's syntax/consistency check on an object *without*
+  activating it. Read-only and safe on any profile, including production. Use it
+  after writing source and before `activate_object`; pass `version:"inactive"`
+  to check source you have saved but not yet activated.
+- **New object types**: `create_structure` / `update_structure` /
+  `patch_structure` (DDIC structures), `create_interface` / `update_interface` /
+  `patch_interface`, `create_ddlx` / `update_ddlx` / `patch_ddlx` (CDS metadata
+  extensions — the UI annotations a Fiori Elements app needs),
+  `create_domain`, `create_data_element`,
+  `create_function_group`, `create_function_module`.
+- **`list_transports`** — find your open transport requests, so you can pass a
+  real request number to the create/update tools.
+- **Fix:** `get_object_info` now sends `Accept: */*`, so DDIC metadata (domains,
+  data elements, tables) is readable instead of failing with HTTP 406.
 - **`update_table` / `patch_table`** — modify an EXISTING DDIC table's source:
   `update_table` overwrites the whole definition, `patch_table` does a surgical
   exact-string replace (add/change a field). Both lock → write → unlock and
