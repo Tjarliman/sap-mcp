@@ -1542,6 +1542,162 @@ server.tool(
 );
 
 server.tool(
+  "where_used",
+  "Find where an object is used (the ADT 'where-used list'). Read-only and safe on any profile. Use it before " +
+  "changing or deleting something to see what depends on it. Results can be huge, so they are capped - the " +
+  "total count is always reported.",
+  {
+    objectUri: z.string().describe("ADT URI of the object, e.g. /sap/bc/adt/ddic/tables/ztjplant_email or /sap/bc/adt/oo/classes/zcl_foo"),
+    maxResults: z.number().optional().default(50).describe("How many references to list (default 50). The true total is always reported."),
+  },
+  async ({ objectUri, maxResults }) => {
+    const host = profile().host;
+    const uri = String(objectUri).replace(/\/source\/main\b.*$/, "").replace(/\/+$/, "");
+
+    const { token, cookies } = await fetchCsrfToken();
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<usagereferences:usageReferenceRequest xmlns:usagereferences="http://www.sap.com/adt/ris/usageReferences">\n` +
+      `  <usagereferences:affectedObjects/>\n` +
+      `</usagereferences:usageReferenceRequest>`;
+
+    const res = await fetch(
+      `${host}/sap/bc/adt/repository/informationsystem/usageReferences?uri=${encodeURIComponent(uri)}`,
+      {
+        method: "POST",
+        headers: {
+          ...authHeaders("application/vnd.sap.adt.repository.usagereferences.result.v1+xml"),
+          "X-CSRF-Token": token,
+          Cookie: cookies,
+          "Content-Type": "application/vnd.sap.adt.repository.usagereferences.request.v1+xml",
+        },
+        body,
+        agent,
+      }
+    );
+    const xml = await res.text();
+    if (!res.ok) throw new Error(`Where-used failed (${res.status}). ${xml}`);
+
+    const total = (xml.match(/numberOfResults="(\d+)"/) || [])[1] || "0";
+    const what = decodeXml((xml.match(/resultDescription="([^"]*)"/) || [])[1] || uri);
+
+    // Each hit carries an adtcore:name/type/description on the inner adtObject.
+    const hits = [...xml.matchAll(/<adtcore:objectReference\b[^>]*\/>|<adtcore:adtObject\b[^>]*|<usageReferences:adtObject\b[^>]*/g)]
+      .map(m => {
+        const a = m[0];
+        const g = (k) => (a.match(new RegExp(`adtcore:${k}="([^"]*)"`)) || [])[1] || "";
+        return { name: g("name"), type: g("type"), desc: decodeXml(g("description")) };
+      })
+      // Drop the package refs that ride along with each hit - they are not usages.
+      .filter(h => h.name && h.type !== "DEVC/K");
+
+    const log = [`Where-used: ${what}`, `Total references: ${total}`];
+    if (!hits.length) {
+      log.push("No individual references could be parsed from the response.");
+      if (Number(total) > 0) log.push(`Raw response (truncated):\n${xml.slice(0, 1200)}`);
+    } else {
+      const shown = hits.slice(0, Math.max(1, maxResults));
+      log.push(`Showing ${shown.length} of ${hits.length} parsed:`);
+      for (const h of shown) log.push(`  ${h.type.padEnd(9)} ${h.name}${h.desc ? ` - ${h.desc}` : ""}`);
+      if (hits.length > shown.length) log.push(`  ... ${hits.length - shown.length} more (raise maxResults to see them)`);
+    }
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "run_atc",
+  "Run an ATC (ABAP Test Cockpit) static-analysis check on an object and report the findings. Read-only and " +
+  "safe on any profile. Use it before releasing a transport, or after building something, to catch the issues " +
+  "your team's ATC variant enforces. Slower than syntax_check - use syntax_check for quick error checking.",
+  {
+    objectUri: z.string().describe("ADT URI of the object, e.g. /sap/bc/adt/oo/classes/zcl_foo"),
+    checkVariant: z.string().optional().describe("ATC check variant. Defaults to the system's configured variant."),
+    maxFindings: z.number().optional().default(100).describe("Maximum findings to request (default 100)"),
+  },
+  async ({ objectUri, checkVariant, maxFindings }) => {
+    const host = profile().host;
+    const uri = String(objectUri).replace(/\/source\/main\b.*$/, "").replace(/\/+$/, "");
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method = "GET", headers = {}, body, accept = "*/*" } = {}) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, Cookie: cookies, ...headers },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    // 1) which check variant? ask the system if the caller didn't say.
+    let variant = checkVariant;
+    if (!variant) {
+      const cust = await call("/sap/bc/adt/atc/customizing");
+      variant = (cust.text.match(/name="systemCheckVariant"\s+value="([^"]*)"/) || [])[1] || "DEFAULT";
+    }
+
+    // 2) open a worklist for that variant
+    const wl = await call(`/sap/bc/adt/atc/worklists?checkVariant=${encodeURIComponent(variant)}`,
+      { method: "POST", accept: "text/plain" });
+    if (!wl.ok) throw new Error(`Could not create an ATC worklist (${wl.status}). ${wl.text}`);
+    const worklistId = wl.text.trim();
+
+    // 3) run the check over this one object
+    const runBody =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<atc:run xmlns:atc="http://www.sap.com/adt/atc" maximumVerdicts="${Math.max(1, maxFindings)}">\n` +
+      `  <objectSets xmlns:adtcore="http://www.sap.com/adt/core">\n` +
+      `    <objectSet kind="inclusive">\n` +
+      `      <adtcore:objectReferences>\n` +
+      `        <adtcore:objectReference adtcore:uri="${escapeXml(uri)}"/>\n` +
+      `      </adtcore:objectReferences>\n` +
+      `    </objectSet>\n` +
+      `  </objectSets>\n` +
+      `</atc:run>`;
+    const run = await call(`/sap/bc/adt/atc/runs?worklistId=${encodeURIComponent(worklistId)}`,
+      { method: "POST", headers: { "Content-Type": "application/xml" }, body: runBody });
+    if (!run.ok) throw new Error(`ATC run failed (${run.status}). ${run.text}`);
+    const stats = (run.text.match(/<atcinfo:description>([^<]*)<\/atcinfo:description>/) || [])[1] || "";
+
+    // 4) read the findings back off the worklist
+    const res = await call(`/sap/bc/adt/atc/worklists/${encodeURIComponent(worklistId)}?includeExemptedFindings=false`,
+      { accept: "application/atc.worklist.v1+xml" });
+    if (!res.ok) throw new Error(`Could not read the ATC worklist (${res.status}). ${res.text}`);
+
+    const findings = [...res.text.matchAll(/<atcfinding:finding\b([^>]*)/g)].map(m => {
+      const a = m[1];
+      const g = (k) => (a.match(new RegExp(`(?:atcfinding:)?${k}="([^"]*)"`)) || [])[1] || "";
+      return {
+        priority: g("priority"),
+        check: decodeXml(g("checkTitle")),
+        message: decodeXml(g("messageTitle")),
+        uri: g("location") || g("uri"),
+      };
+    });
+
+    const log = [`ATC check of ${uri}`, `Variant: ${variant}`];
+    if (stats) log.push(`Finding stats (prio 1,2,3): ${stats}`);
+    if (!findings.length) {
+      log.push(/^[0,\s]*$/.test(stats) ? "OK - no ATC findings." : "No individual findings parsed.");
+      if (stats && !/^[0,\s]*$/.test(stats)) log.push(`Raw worklist (truncated):\n${res.text.slice(0, 1200)}`);
+    } else {
+      log.push(`${findings.length} finding(s):`);
+      for (const f of findings.slice(0, Math.max(1, maxFindings))) {
+        log.push(`  [prio ${f.priority || "?"}] ${f.message || f.check}${f.check && f.message ? `  (${f.check})` : ""}`);
+      }
+    }
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
   "activate_object",
   "Activate one or more existing ABAP objects and report the raw activation result. " +
   "Pass a single object (objectUri + objectName), or several at once via `objects` - " +

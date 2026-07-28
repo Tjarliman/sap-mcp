@@ -91,6 +91,13 @@ must fully quit and restart Claude Code after updating** (see the note above).
   extensions — the UI annotations a Fiori Elements app needs),
   `create_domain`, `create_data_element`,
   `create_function_group`, `create_function_module`.
+- **`where_used`** — the ADT where-used list: find everything that depends on an
+  object before you change or delete it. Read-only; results are capped and the
+  true total is always reported (a common table can have tens of thousands).
+- **`run_atc`** — run an ATC (ABAP Test Cockpit) static-analysis check on an
+  object and report the findings. Read-only. Picks up the system's configured
+  check variant automatically. Use `syntax_check` for fast error checking and
+  `run_atc` before releasing a transport.
 - **`list_transports`** — find your open transport requests, so you can pass a
   real request number to the create/update tools.
 - **Fix:** `get_object_info` now sends `Accept: */*`, so DDIC metadata (domains,
