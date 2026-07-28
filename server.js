@@ -1458,6 +1458,72 @@ server.tool(
   }
 );
 
+server.tool(
+  "create_table_type",
+  "Create a new DDIC table type (TTYP/DA) - the ABAP type for an internal table - and optionally activate it. " +
+  "Point it at a dictionary type (structure/data element/table) with rowTypeKind='dictionaryType' and " +
+  "rowTypeName, or at a built-in type with rowTypeKind='predefinedAbapType' plus dataType/length. " +
+  "Refuses to run on production profiles.",
+  {
+    tableTypeName: z.string().describe("Table type name, e.g. ZTT_PLANT_EMAIL"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    rowTypeKind: z.enum(["dictionaryType", "predefinedAbapType"]).optional().default("dictionaryType")
+      .describe("Where the row type comes from"),
+    rowTypeName: z.string().optional().describe("Structure/data element/table name when rowTypeKind='dictionaryType', e.g. ZST_PLANT_EMAIL"),
+    dataType: z.string().optional().describe("Built-in type when rowTypeKind='predefinedAbapType', e.g. STRING, CHAR"),
+    length: z.number().optional().default(0).describe("Length for a built-in row type"),
+    decimals: z.number().optional().default(0).describe("Decimals for a built-in row type"),
+    accessType: z.enum(["standard", "sorted", "hashed", "index"]).optional().default("standard")
+      .describe("Internal table access type"),
+    keyKind: z.enum(["unique", "nonUnique", "notSpecified"]).optional().default("nonUnique")
+      .describe("Primary key uniqueness"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after creating"),
+  },
+  async (a) => {
+    const name = a.tableTypeName.toUpperCase();
+    if (a.rowTypeKind === "dictionaryType" && !a.rowTypeName)
+      throw new Error("rowTypeName is required when rowTypeKind='dictionaryType'.");
+    if (a.rowTypeKind === "predefinedAbapType" && !a.dataType)
+      throw new Error("dataType is required when rowTypeKind='predefinedAbapType'.");
+
+    // ADT expects the whole rowType block even when half of it is empty.
+    const rowType =
+      `<ttyp:rowType><ttyp:typeKind>${a.rowTypeKind}</ttyp:typeKind>` +
+      (a.rowTypeName ? `<ttyp:typeName>${escapeXml(a.rowTypeName.toUpperCase())}</ttyp:typeName>` : `<ttyp:typeName/>`) +
+      `<ttyp:builtInType><ttyp:dataType>${escapeXml((a.dataType || "").toUpperCase())}</ttyp:dataType>` +
+      `<ttyp:length>${pad6(a.length)}</ttyp:length><ttyp:decimals>${pad6(a.decimals)}</ttyp:decimals></ttyp:builtInType>` +
+      `<ttyp:rangeType/></ttyp:rowType>`;
+
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<ttyp:tableType xmlns:ttyp="http://www.sap.com/dictionary/tabletype" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:name="${escapeXml(name)}" adtcore:type="TTYP/DA" ` +
+      `adtcore:description="${escapeXml(a.description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN">` +
+      `<adtcore:packageRef adtcore:name="${escapeXml(a.packageName.toUpperCase())}"/>` +
+      rowType +
+      `<ttyp:initialRowCount>00000</ttyp:initialRowCount>` +
+      `<ttyp:accessType>${a.accessType}</ttyp:accessType>` +
+      `<ttyp:primaryKey ttyp:isVisible="true" ttyp:isEditable="true">` +
+      `<ttyp:definition>standard</ttyp:definition><ttyp:kind>${a.keyKind}</ttyp:kind>` +
+      `<ttyp:components ttyp:isVisible="false"/><ttyp:alias/></ttyp:primaryKey>` +
+      `<ttyp:secondaryKeys ttyp:isVisible="true" ttyp:isEditable="true">` +
+      `<ttyp:allowed>notSpecified</ttyp:allowed></ttyp:secondaryKeys>` +
+      `</ttyp:tableType>`;
+
+    const text = await createXmlObject({
+      name, uri: `/sap/bc/adt/ddic/tabletypes/${a.tableTypeName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/ddic/tabletypes",
+      contentType: "application/vnd.sap.adt.tabletype.v1+xml",
+      shell, corrNr: a.transport, activate: a.activate, kind: "table type",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
 // --- transports -----------------------------------------------------------
 
 server.tool(
