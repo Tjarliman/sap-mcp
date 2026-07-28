@@ -1385,17 +1385,37 @@ server.tool(
     if (a.typeKind === "domain" && !a.typeName) throw new Error("typeName (the domain) is required when typeKind='domain'.");
     if (a.typeKind === "predefinedAbapType" && !a.dataType) throw new Error("dataType is required when typeKind='predefinedAbapType'.");
 
-    const short = a.shortLabel || a.description.slice(0, 10);
-    const medium = a.mediumLabel || a.description.slice(0, 20);
-    const long = a.longLabel || a.description.slice(0, 40);
-    const heading = a.headingLabel || short;
+    // SAP's fixed maxima for the four field labels.
+    const MAX = { short: 10, medium: 20, long: 40, heading: 55 };
+    const short = (a.shortLabel || a.description).slice(0, MAX.short);
+    const medium = (a.mediumLabel || a.description).slice(0, MAX.medium);
+    const long = (a.longLabel || a.description).slice(0, MAX.long);
+    const heading = (a.headingLabel || short).slice(0, MAX.heading);
 
-    const typeBits = a.typeKind === "domain"
-      ? `<dtel:typeKind>domain</dtel:typeKind><dtel:typeName>${escapeXml(a.typeName.toUpperCase())}</dtel:typeName>`
-      : `<dtel:typeKind>predefinedAbapType</dtel:typeKind>` +
-        `<dtel:dataType>${escapeXml((a.dataType || "").toUpperCase())}</dtel:dataType>` +
-        `<dtel:dataTypeLength>${pad6(a.length)}</dtel:dataTypeLength>` +
-        `<dtel:dataTypeDecimals>${pad6(a.decimals)}</dtel:dataTypeDecimals>`;
+    // ADT wants the technical type spelled out even when the element points at a
+    // domain, so read it off the domain rather than making the caller repeat it.
+    let dataType = (a.dataType || "").toUpperCase();
+    let length = a.length;
+    let decimals = a.decimals;
+    if (a.typeKind === "domain") {
+      try {
+        const dom = await adtGet(`/sap/bc/adt/ddic/domains/${a.typeName.toLowerCase()}`, "*/*");
+        dataType = (dom.match(/<doma:datatype>([^<]*)</) || [])[1] || dataType;
+        length = Number((dom.match(/<doma:length>(\d+)</) || [])[1] ?? length ?? 0);
+        decimals = Number((dom.match(/<doma:decimals>(\d+)</) || [])[1] ?? decimals ?? 0);
+      } catch {
+        if (!dataType) throw new Error(
+          `Could not read domain ${a.typeName} to determine its type. Check the name, or pass dataType/length explicitly.`);
+      }
+    }
+
+    const typeBits =
+      (a.typeKind === "domain"
+        ? `<dtel:typeKind>domain</dtel:typeKind><dtel:typeName>${escapeXml(a.typeName.toUpperCase())}</dtel:typeName>`
+        : `<dtel:typeKind>predefinedAbapType</dtel:typeKind>`) +
+      `<dtel:dataType>${escapeXml(dataType)}</dtel:dataType>` +
+      `<dtel:dataTypeLength>${pad6(length)}</dtel:dataTypeLength>` +
+      `<dtel:dataTypeDecimals>${pad6(decimals)}</dtel:dataTypeDecimals>`;
 
     const shell =
       `<?xml version="1.0" encoding="UTF-8"?>\n` +
@@ -1407,10 +1427,25 @@ server.tool(
       `<adtcore:packageRef adtcore:name="${escapeXml(a.packageName.toUpperCase())}"/>` +
       `<dtel:dataElement xmlns:dtel="http://www.sap.com/adt/dictionary/dataelements">` +
       typeBits +
-      `<dtel:shortFieldLabel>${escapeXml(short)}</dtel:shortFieldLabel><dtel:shortFieldLength>${short.length}</dtel:shortFieldLength>` +
-      `<dtel:mediumFieldLabel>${escapeXml(medium)}</dtel:mediumFieldLabel><dtel:mediumFieldLength>${medium.length}</dtel:mediumFieldLength>` +
-      `<dtel:longFieldLabel>${escapeXml(long)}</dtel:longFieldLabel><dtel:longFieldLength>${long.length}</dtel:longFieldLength>` +
-      `<dtel:headingFieldLabel>${escapeXml(heading)}</dtel:headingFieldLabel><dtel:headingFieldLength>${heading.length}</dtel:headingFieldLength>` +
+      `<dtel:shortFieldLabel>${escapeXml(short)}</dtel:shortFieldLabel>` +
+      `<dtel:shortFieldLength>${short.length}</dtel:shortFieldLength>` +
+      `<dtel:shortFieldMaxLength>${MAX.short}</dtel:shortFieldMaxLength>` +
+      `<dtel:mediumFieldLabel>${escapeXml(medium)}</dtel:mediumFieldLabel>` +
+      `<dtel:mediumFieldLength>${medium.length}</dtel:mediumFieldLength>` +
+      `<dtel:mediumFieldMaxLength>${MAX.medium}</dtel:mediumFieldMaxLength>` +
+      `<dtel:longFieldLabel>${escapeXml(long)}</dtel:longFieldLabel>` +
+      `<dtel:longFieldLength>${long.length}</dtel:longFieldLength>` +
+      `<dtel:longFieldMaxLength>${MAX.long}</dtel:longFieldMaxLength>` +
+      `<dtel:headingFieldLabel>${escapeXml(heading)}</dtel:headingFieldLabel>` +
+      `<dtel:headingFieldLength>${heading.length}</dtel:headingFieldLength>` +
+      `<dtel:headingFieldMaxLength>${MAX.heading}</dtel:headingFieldMaxLength>` +
+      // ADT's schema is a strict sequence - these trailing elements are required
+      // even when empty (verified against a standard data element).
+      `<dtel:searchHelp/><dtel:searchHelpParameter/><dtel:setGetParameter/><dtel:defaultComponentName/>` +
+      `<dtel:deactivateInputHistory>false</dtel:deactivateInputHistory>` +
+      `<dtel:changeDocument>false</dtel:changeDocument>` +
+      `<dtel:leftToRightDirection>false</dtel:leftToRightDirection>` +
+      `<dtel:deactivateBIDIFiltering>false</dtel:deactivateBIDIFiltering>` +
       `</dtel:dataElement></blue:wbobj>`;
 
     const text = await createXmlObject({
