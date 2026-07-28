@@ -1227,6 +1227,168 @@ server.tool(
 );
 
 server.tool(
+  "update_table",
+  "Overwrite the source (field definitions) of an EXISTING DDIC database table. Locks, PUTs the whole new DDL " +
+  "source, unlocks, then optionally activates. Refuses to run on production profiles. IMPORTANT: this REPLACES " +
+  "the whole table definition - read it first, edit that text, and send the complete result back. Activating a " +
+  "structure change triggers a DATABASE CONVERSION when the table holds data, so activate defaults to false; " +
+  "review and activate in SE11. Prefer patch_table for small edits.",
+  {
+    tableName: z.string().describe("Table name, e.g. ZKIT_PRODUCT"),
+    source: z.string().describe("Complete new DDL source - REPLACES the entire table definition"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP tables."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - a structure change may convert the DB; activate in SE11 yourself."),
+  },
+  async ({ tableName, source, transport: corrNr, activate }) => {
+    assertWritable();
+    if (!source || !source.trim()) throw new Error("Refusing to write an empty source - that would wipe the table.");
+
+    const name = tableName.toUpperCase();
+    const uri = `/sap/bc/adt/ddic/tables/${tableName.toLowerCase()}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    // Confirm the table exists (create_table, not this, makes new ones).
+    const probe = await call(`${uri}/source/main`, { method: "GET", accept: "text/plain" });
+    if (probe.status === 404) throw new Error(`Table ${name} not found. Use create_table to create a new one.`);
+    if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+    log.push(`Target: ${uri}`);
+    log.push(`Current size: ${probe.text.split("\n").length} lines -> new: ${source.split("\n").length} lines.`);
+
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    let wrote = false;
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    // Activate only after the lock is released.
+    if (wrote && activate) await runActivation(call, uri, name, log, "table");
+    else if (wrote) log.push("Not activated (activate=false) - review and activate in SE11 (a structure change may convert the DB).");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "patch_table",
+  "Modify PART of an existing DDIC database table's DDL without resending the whole definition. Reads the " +
+  "current source, replaces oldString with newString (must match EXACTLY ONCE), then locks, PUTs, unlocks, and " +
+  "optionally activates. Prefer this over update_table for small edits like adding a field. Refuses to run on " +
+  "production profiles. Activating a structure change may convert the DB, so activate defaults to false.",
+  {
+    tableName: z.string().describe("Table name, e.g. ZKIT_PRODUCT"),
+    oldString: z.string().describe("Exact existing DDL text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP tables."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false - activate in SE11 yourself."),
+  },
+  async ({ tableName, oldString, newString, transport: corrNr, activate }) => {
+    assertWritable();
+    if (!oldString) throw new Error("oldString must not be empty.");
+    if (oldString === newString) throw new Error("oldString and newString are identical - nothing to do.");
+
+    const name = tableName.toUpperCase();
+    const uri = `/sap/bc/adt/ddic/tables/${tableName.toLowerCase()}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const probe = await call(`${uri}/source/main`, { method: "GET", accept: "text/plain" });
+    if (probe.status === 404) throw new Error(`Table ${name} not found. Use create_table to create a new one.`);
+    if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+
+    const nl = s => String(s).replace(/\r\n/g, "\n");
+    const before = nl(probe.text);
+    oldString = nl(oldString);
+    newString = nl(newString);
+
+    const hits = before.split(oldString).length - 1;
+    if (hits === 0) {
+      const firstLine = oldString.split("\n")[0];
+      const near = before.split("\n").filter(l => l.includes(firstLine.trim()) && firstLine.trim());
+      throw new Error(`oldString not found in ${name}. Nothing written.` + (near.length ? ` Lines containing the first line of oldString: ${JSON.stringify(near.slice(0, 5))}` : ""));
+    }
+    if (hits > 1) throw new Error(`oldString matched ${hits} times in ${name}. Nothing written. Add surrounding context to make it unique.`);
+    const after = before.replace(oldString, newString);
+
+    log.push(`Target: ${uri}`);
+    log.push(`Patched 1 occurrence. Lines ${before.split("\n").length} -> ${after.split("\n").length}.`);
+
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    let wrote = false;
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: after }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    if (wrote && activate) await runActivation(call, uri, name, log, "table");
+    else if (wrote) log.push("Not activated (activate=false) - review and activate in SE11.");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
   "patch_function_module",
   "Modify PART of an existing ABAP function module. Function-module source lives inside a function group, " +
   "so it must be locked/written through the fmodules URI - patch_program_source CANNOT do it (SAP rejects " +

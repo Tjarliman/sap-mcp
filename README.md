@@ -71,6 +71,12 @@ To confirm the update loaded, start a fresh session and ask Claude to run
 
 ### What's new (2026-07)
 
+- **`update_table` / `patch_table`** — modify an EXISTING DDIC table's source:
+  `update_table` overwrites the whole definition, `patch_table` does a surgical
+  exact-string replace (add/change a field). Both lock → write → unlock and
+  optionally activate; blocked on production. Mirrors the
+  `update_program_source` / `patch_program_source` pair. **New tools — restart
+  Claude Code after updating** (see above).
 - **`create_program`** — create a brand-new classic ABAP report (executable
   program, `PROG/P`) and activate it in one call. Previously the server could
   only *edit* an existing program; now it can create one from scratch. Refuses
