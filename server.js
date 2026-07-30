@@ -17,7 +17,11 @@ try {
 
 // Profiles are DISCOVERED from .env: every SAP_<KEY>_HOST defines a profile
 // named <KEY>, with matching SAP_<KEY>_CLIENT / _USER / _PASS. Add or edit a
-// profile by editing .env - no code change needed. Optional friendly labels:
+// profile by editing .env - no code change needed.
+//
+// Display names come from SAP_<KEY>_LABEL in .env when present. The map below
+// is only a fallback for the profiles this connector shipped with, so a new
+// system can be named without touching this file.
 const PROFILE_LABELS = {
   ABLD: "Development",
   DEV120: "Development (client 120)",
@@ -43,8 +47,10 @@ function discoverProfiles() {
     // don't want touched.
     const readonly =
       envFlag(process.env[`SAP_${key}_READONLY`]) || envFlag(process.env[`SAP_${key}_PROD`]);
+    const envLabel = String(process.env[`SAP_${key}_LABEL`] || "").trim();
     out[key] = {
-      label: PROFILE_LABELS[key] || key,
+      // .env wins, then the built-in fallback map, then the bare key.
+      label: envLabel || PROFILE_LABELS[key] || key,
       host: process.env[`SAP_${key}_HOST`],
       client: process.env[`SAP_${key}_CLIENT`],
       user: process.env[`SAP_${key}_USER`],

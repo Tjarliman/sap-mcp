@@ -162,7 +162,13 @@ SAP_PRD2_READONLY=true      # or SAP_PRD2_PROD=true
 ```
 
 Accepted values: `true` / `1` / `yes` / `y` / `X`. **Do this for every
-production system you add** — no code change needed.
+production system you add** — no code change needed. Add
+`SAP_PRD2_LABEL="Production"` to control how the profile is described by
+`list_servers`.
+
+> The flag protects a **profile**, not a system. If two profiles point at the
+> same host *and* client, flag both — otherwise writes still reach that client
+> through the unflagged one.
 
 `ABLP` and `ABLQ` are *also* blocked by a built-in list in `server.js`, so they
 stay protected even if the flag is missing. The two sources are **additive**: a
