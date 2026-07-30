@@ -148,8 +148,28 @@ list below is illustrative, not fixed, so add or rename systems freely:
 | `ABLP`   | Production               |
 | `snet2`  | S/4HANA on-prem          |
 
-Writes to `ABLP` (production) and `ABLQ` (QAS) are blocked in `server.js`; read
-access is allowed on every profile.
+### Protecting a system from writes
+
+Add a `READONLY` (or `PROD`) flag next to any profile in `.env` and every write
+on it — create, edit, activate — is refused. Reads keep working:
+
+```bash
+SAP_PRD2_HOST="https://sap-prd2.example.com:44300"
+SAP_PRD2_CLIENT="100"
+SAP_PRD2_USER=""
+SAP_PRD2_PASS=""
+SAP_PRD2_READONLY=true      # or SAP_PRD2_PROD=true
+```
+
+Accepted values: `true` / `1` / `yes` / `y` / `X`. **Do this for every
+production system you add** — no code change needed.
+
+`ABLP` and `ABLQ` are *also* blocked by a built-in list in `server.js`, so they
+stay protected even if the flag is missing. The two sources are **additive**: a
+missing flag can never unblock a system that was protected before.
+
+Run `list_servers` to confirm — protected profiles are shown as `[read-only]`.
+A blocked write reports which rule stopped it.
 
 ## Disclaimer
 

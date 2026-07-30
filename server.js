@@ -27,18 +27,29 @@ const PROFILE_LABELS = {
   SNET2: "S/4HANA on-prem",
 };
 
+// Accepts the spellings people actually use for a boolean in a .env / in SAP.
+function envFlag(value) {
+  return /^(true|1|yes|y|x)$/i.test(String(value || "").trim());
+}
+
 function discoverProfiles() {
   const out = {};
   for (const name of Object.keys(process.env)) {
     const m = /^SAP_(.+)_HOST$/.exec(name);
     if (!m) continue;
     const key = m[1];
+    // SAP_<KEY>_READONLY / _PROD marks a system as write-protected. Either name
+    // works; PROD reads better for production, READONLY for anything you just
+    // don't want touched.
+    const readonly =
+      envFlag(process.env[`SAP_${key}_READONLY`]) || envFlag(process.env[`SAP_${key}_PROD`]);
     out[key] = {
       label: PROFILE_LABELS[key] || key,
       host: process.env[`SAP_${key}_HOST`],
       client: process.env[`SAP_${key}_CLIENT`],
       user: process.env[`SAP_${key}_USER`],
       pass: process.env[`SAP_${key}_PASS`],
+      readonly,
     };
   }
   return out;
@@ -55,10 +66,17 @@ function resolveProfileKey(name) {
 
 let activeProfile = PROFILES.ABLD ? "ABLD" : Object.keys(PROFILES)[0] || "ABLD";
 
-// Profiles that must never be written to (matched case-insensitively).
+// Profiles that must never be written to. Two sources, combined:
+//   1. this built-in list (matched case-insensitively), and
+//   2. SAP_<KEY>_READONLY=true / SAP_<KEY>_PROD=true in .env.
+// They are ADDITIVE on purpose: a missing .env flag can never silently unblock
+// a system that was protected before.
 const WRITE_BLOCKED_PROFILES = new Set(["ABLP", "ABLQ"]);
 function isWriteBlocked(key) {
-  return WRITE_BLOCKED_PROFILES.has(String(key || "").toUpperCase());
+  const k = String(key || "").toUpperCase();
+  if (WRITE_BLOCKED_PROFILES.has(k)) return true;
+  const p = PROFILES[key] || PROFILES[resolveProfileKey(key) || ""] || null;
+  return !!(p && p.readonly);
 }
 
 function profile() {
@@ -82,10 +100,13 @@ function profile() {
 
 function assertWritable() {
   if (isWriteBlocked(activeProfile)) {
-    const p = PROFILES[activeProfile];
+    const p = PROFILES[activeProfile] || {};
+    const why = p.readonly
+      ? `It is marked read-only in .env (SAP_${String(activeProfile).toUpperCase()}_READONLY)`
+      : `It is a protected system in this connector's built-in list`;
     throw new Error(
-      `Writes are blocked on profile "${activeProfile}" (${p.label}, client ${p.client}). ` +
-      `This is a production system. Switch to a development profile first.`
+      `Writes are blocked on profile "${activeProfile}" (${p.label || activeProfile}, client ${p.client || "?"}). ` +
+      `${why}. Switch to a development profile first.`
     );
   }
 }
