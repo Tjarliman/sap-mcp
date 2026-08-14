@@ -916,6 +916,87 @@ server.tool(
   }
 );
 
+// --- access control / DCL (DCLS/DL) - source-based, same shape as CDS/SRVD/BDEF ---
+// Verified live against a real system: reads as <dcl:dclSource abapsource:sourceUri=
+// "source/main" ...>, i.e. a genuine text source exactly like CDS/SRVD/BDEF, not an
+// XML-only object like domain/message class.
+
+const dclUri = n => `/sap/bc/adt/acm/dcl/sources/${n.toLowerCase()}`;
+
+server.tool(
+  "create_dcl",
+  "Create a new Access Control / DCL source (DCLS) for a CDS view and activate it. Refuses to run on " +
+  "production profiles. Provide the complete DCL source, e.g. \"define role <name> { grant select on " +
+  "<cds view> where (<field>) = aspect pfcg_auth(<auth object>, <auth field>, ACTVT = '03'); }\" - the role " +
+  "name must match dclName. Needs a transport unless package is $TMP.",
+  {
+    dclName: z.string().describe("DCL/access control name, e.g. ZAC_MY_ENTITY. Must match the role name in the source."),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    source: z.string().describe("Complete DCL source (define role <name> { grant select on ... ; })"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ dclName, description, packageName, source, transport: corrNr, activate }) => {
+    const name = dclName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<dcl:dclSource xmlns:dcl="http://www.sap.com/adt/acm/dclsources" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:description="${escapeXml(description)}" adtcore:name="${escapeXml(name)}" ` +
+      `adtcore:type="DCLS/DL" adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</dcl:dclSource>`;
+    const text = await createSourceObject({
+      name, uri: dclUri(dclName),
+      createEndpoint: "/sap/bc/adt/acm/dcl/sources",
+      contentType: "application/vnd.sap.adt.dclSource+xml",
+      shell, source, corrNr, activate, kind: "access control",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_dcl",
+  "Overwrite the source of an EXISTING Access Control / DCL source. REPLACES the whole definition - read it " +
+  "first and send the complete result back. Refuses to run on production profiles. Prefer patch_dcl for small edits.",
+  {
+    dclName: z.string().describe("DCL/access control name, e.g. ZAC_MY_ENTITY"),
+    source: z.string().describe("Complete new DCL source - REPLACES the entire definition"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ dclName, source, transport: corrNr, activate }) => {
+    const text = await editSourceObject({
+      name: dclName.toUpperCase(), uri: dclUri(dclName),
+      transform: wholeSource(source), corrNr, activate, kind: "access control", createHint: "create_dcl",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_dcl",
+  "Modify PART of an existing Access Control / DCL source (e.g. change one condition). Replaces oldString " +
+  "with newString (must match EXACTLY ONCE). Refuses to run on production profiles.",
+  {
+    dclName: z.string().describe("DCL/access control name, e.g. ZAC_MY_ENTITY"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ dclName, oldString, newString, transport: corrNr, activate }) => {
+    const name = dclName.toUpperCase();
+    const text = await editSourceObject({
+      name, uri: dclUri(dclName),
+      transform: replaceOnce(oldString, newString, name), corrNr, activate, kind: "access control", createHint: "create_dcl",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
 server.tool(
   "create_table",
   "Create a new DDIC transparent table (TABL) in SAP and activate it. Refuses to run " +
@@ -1096,6 +1177,71 @@ async function createXmlObject({ name, uri, createEndpoint, contentType, shell, 
 
   if (activate) await runActivation(call, uri, name, log, kind);
   else log.push("Not activated (activate=false) - activate it with activate_object.");
+
+  return log.join("\n");
+}
+
+// Shared edit flow for ADT XML-content objects (domain, data element, table
+// type, ...) - same lock/PUT/unlock/activate shape as editSourceObject, but
+// there is no /source/main: the whole object's own URI IS the read/write
+// resource (confirmed via the ADT discovery document's {?corrNr,lockHandle,
+// version,accessMode,_action} template on these objects' base collection).
+async function editXmlObject({ name, uri, transform, contentType, corrNr, activate, kind, createHint }) {
+  assertWritable();
+  const host = profile().host;
+  const log = [];
+
+  const { token, cookies: initialCookies } = await fetchCsrfToken();
+  let cookies = initialCookies;
+  if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+  const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+    const res = await fetch(`${host}${path}`, {
+      method,
+      headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+      body,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    return { ok: res.ok, status: res.status, text: await res.text() };
+  };
+
+  const probe = await call(uri, { method: "GET", accept: "*/*" });
+  if (probe.status === 404) throw new Error(`${kind} ${name} not found. Use ${createHint} to create a new one.`);
+  if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+
+  const before = String(probe.text).replace(/\r\n/g, "\n");
+  const after = transform(before, log);
+  log.push(`Target: ${uri}`);
+
+  const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+    method: "POST",
+    accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+  });
+  if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+  const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+  if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+  log.push("Locked.");
+
+  let wrote = false;
+  try {
+    const put = await call(
+      `${uri}?lockHandle=${encodeURIComponent(handle)}` +
+      (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+      { method: "PUT", headers: { "Content-Type": contentType }, body: after }
+    );
+    if (!put.ok) throw new Error(`PUT failed (${put.status}). ${put.text}`);
+    log.push(`Written${corrNr ? ` on ${corrNr}` : ""}.`);
+    wrote = true;
+  } finally {
+    const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+      method: "POST",
+    });
+    log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+  }
+
+  if (wrote && activate) await runActivation(call, uri, name, log, kind);
+  else if (wrote) log.push(`Not activated (activate=false) - activate it yourself or with activate_object.`);
 
   return log.join("\n");
 }
@@ -1548,6 +1694,153 @@ server.tool(
       shell, corrNr: a.transport, activate: a.activate, kind: "table type",
     });
     return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_table_type",
+  "Modify PART of an existing DDIC table type's XML definition (e.g. change accessType, keyKind, or the row " +
+  "type). Replaces oldString with newString (must match EXACTLY ONCE) in the object's raw XML - read it first " +
+  "with get_object_info to see the exact text to target. Refuses to run on production profiles.",
+  {
+    tableTypeName: z.string().describe("Table type name, e.g. ZTT_PLANT_EMAIL"),
+    oldString: z.string().describe("Exact existing XML text to replace. Must occur exactly once."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate after writing. Default false."),
+  },
+  async ({ tableTypeName, oldString, newString, transport: corrNr, activate }) => {
+    const name = tableTypeName.toUpperCase();
+    const text = await editXmlObject({
+      name, uri: `/sap/bc/adt/ddic/tabletypes/${tableTypeName.toLowerCase()}`,
+      transform: replaceOnce(oldString, newString, name),
+      contentType: "application/vnd.sap.adt.tabletype.v1+xml",
+      corrNr, activate, kind: "table type", createHint: "create_table_type",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+// --- message class (structured content, no text source) -------------------
+// MSAG has no DDL-like text syntax (SE91 is a form editor) - the whole class,
+// including its numbered messages, lives in one XML document at its own URI
+// (no /source/main). Verified live against a real system: GET returns
+// <mc:messageClass> with <mc:messages mc:msgno=".." mc:msgtext=".."> children,
+// one per message. Shell creation mirrors the same createBodySimple shape
+// abap-adt-api uses for this type (packageRef only, Content-Type application/*).
+
+server.tool(
+  "create_message_class",
+  "Create a new empty Message Class (MSAG) and optionally activate it. A message class is a named container " +
+  "for numbered messages (T100 texts) used by MESSAGE/RAISE statements and RAP failed/reported responses. " +
+  "Creates the empty class only - add messages afterwards with patch_message_class. Refuses to run on " +
+  "production profiles.",
+  {
+    messageClassName: z.string().describe("Message class name, e.g. ZCL_MY_MESSAGES (max 20 chars)"),
+    description: z.string().describe("Short description"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway."),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after creating"),
+  },
+  async ({ messageClassName, description, packageName, transport: corrNr, activate }) => {
+    const name = messageClassName.toUpperCase();
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<mc:messageClass xmlns:mc="http://www.sap.com/adt/MessageClass" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:name="${escapeXml(name)}" adtcore:type="MSAG/N" ` +
+      `adtcore:description="${escapeXml(description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN">` +
+      `<adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>` +
+      `</mc:messageClass>`;
+    const text = await createXmlObject({
+      name, uri: `/sap/bc/adt/messageclass/${messageClassName.toLowerCase()}`,
+      createEndpoint: "/sap/bc/adt/messageclass",
+      contentType: "application/*",
+      shell, corrNr, activate, kind: "message class",
+    });
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "patch_message_class",
+  "Add or update ONE numbered message (T100 text) in an existing Message Class, then optionally activate. " +
+  "Writes directly to that message's own sub-resource - confirmed against the ADT discovery document " +
+  "(/sap/bc/adt/messageclass/{name}/messages/{msgno}), the same endpoint the atom:link on a GET of the class " +
+  "points to for each message. PUT is an upsert: works whether the number already exists or not. Use &1 &2 " +
+  "&3 &4 in text as placeholders for MESSAGE ... WITH values. Refuses to run on production profiles.",
+  {
+    messageClassName: z.string().describe("Message class name, e.g. ZCL_MY_MESSAGES"),
+    msgno: z.string().describe("Message number, e.g. '001' (zero-padded to 3 digits automatically)"),
+    text: z.string().describe("Message text, max 73 chars. Use &1 &2 &3 &4 for placeholders."),
+    selfExplanatory: z.boolean().optional().default(true).describe("Whether the message is self-explanatory (no long text needed)"),
+    transport: z.string().optional().describe("Transport request. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing"),
+  },
+  async ({ messageClassName, msgno, text: msgtext, selfExplanatory, transport: corrNr, activate }) => {
+    assertWritable();
+    const name = messageClassName.toUpperCase();
+    const no = String(msgno).trim().padStart(3, "0");
+    const uri = `/sap/bc/adt/messageclass/${messageClassName.toLowerCase()}`;
+    const msgUri = `${uri}/messages/${no}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: { ...authHeaders(accept), "X-CSRF-Token": token, "x-sap-adt-sessiontype": "stateful", Cookie: cookies, ...headers },
+        body, agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const probe = await call(uri, { method: "GET" });
+    if (probe.status === 404) throw new Error(`Message class ${name} not found. Use create_message_class to create it first.`);
+    if (!probe.ok) throw new Error(`Cannot read ${name} (${probe.status}). ${probe.text}`);
+
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    // The message element needs its own namespace declarations when sent
+    // standalone (it's normally a child of <mc:messageClass>, which is where
+    // a GET declares xmlns:mc/xmlns:adtcore).
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<mc:messages xmlns:mc="http://www.sap.com/adt/MessageClass" xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `mc:msgno="${no}" mc:msgtext="${escapeXml(msgtext)}" ` +
+      `mc:selfexplainatory="${selfExplanatory ? "true" : "false"}" mc:documented="false" adtcore:name=""/>`;
+
+    let wrote = false;
+    try {
+      const put = await call(
+        `${msgUri}?lockHandle=${encodeURIComponent(handle)}` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "application/*" }, body }
+      );
+      if (!put.ok) throw new Error(`PUT failed (${put.status}). ${put.text}`);
+      log.push(`Message ${no} written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, { method: "POST" });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    if (wrote && activate) await runActivation(call, uri, name, log, "message class");
+    else if (wrote) log.push("Not activated (activate=false).");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
   }
 );
 
@@ -2127,6 +2420,155 @@ server.tool(
   }
 );
 
+// Text elements (text symbols/selection texts/list headings) are a SEPARATE
+// ADT sub-resource from a program/class/function group's source - they don't
+// live in the source itself, so update_program_source etc. can never touch
+// them. Verified against the open-source abap-adt-api client and its own
+// test suite (github.com/marcellourbani/abap-adt-api, src/api/textelements.ts):
+// URL is /sap/bc/adt/textelements/{programs|classes|functiongroups}/<name>,
+// read/write is GET/PUT .../source/<category> with an
+// application/vnd.sap.adt.textelements.<category>.v1 media type, and the lock
+// target is that textelements URL itself (not the object's main source URI).
+// Unlike source code, text elements need NO activation step - confirmed by
+// that client's own disruptive write test (lock -> get -> PUT -> done).
+function textElementsUri(objectType, name) {
+  const lower = name.toLowerCase();
+  const encoded = lower.includes("/") ? encodeURIComponent(lower) : lower;
+  const t = String(objectType || "").toUpperCase();
+  if (t.startsWith("CLAS")) return `/sap/bc/adt/textelements/classes/${encoded}`;
+  if (t.startsWith("FUGR")) return `/sap/bc/adt/textelements/functiongroups/${encoded}`;
+  return `/sap/bc/adt/textelements/programs/${encoded}`;
+}
+
+// Body format is line-based key=text pairs, blank-line separated, with an
+// optional @MaxLength:n line (symbols only) immediately before an entry.
+function parseTextElements(body) {
+  const elements = [];
+  let pendingMaxLength;
+  for (const raw of String(body || "").split("\n")) {
+    // Only used to detect blank separator lines and the @MaxLength marker -
+    // the text itself is sliced from the UNTRIMMED line below, so meaningful
+    // trailing spaces in an existing symbol's value (common in aligned report
+    // headers) survive a read-merge-write round trip instead of being
+    // silently stripped every time an unrelated symbol on the same object
+    // gets patched.
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const m = /^@MaxLength:(\d+)$/.exec(trimmed);
+    if (m) { pendingMaxLength = parseInt(m[1], 10); continue; }
+    const eq = raw.indexOf("=");
+    if (eq <= 0) continue;
+    const id = raw.slice(0, eq).trim();
+    const text = raw.slice(eq + 1).replace(/\r$/, "");
+    elements.push(pendingMaxLength ? { id, text, maxLength: pendingMaxLength } : { id, text });
+    pendingMaxLength = undefined;
+  }
+  return elements;
+}
+
+function formatTextElements(elements) {
+  const lines = [];
+  for (const el of elements) {
+    if (el.maxLength) lines.push(`@MaxLength:${el.maxLength}`);
+    lines.push(`${el.id.toUpperCase()}=${el.text}`);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+server.tool(
+  "patch_text_elements",
+  "Add or update TEXT SYMBOLS (TEXT-xxx) for an existing ABAP program, class, or function group. " +
+  "This is a SEPARATE ADT object from the source code - update_program_source/update_class etc. cannot touch it. " +
+  "Reads the current text symbols, merges in the given ones (matched by 3-character id, case-insensitive; an " +
+  "existing id is overwritten, a new one is added), then writes the merged result back. Existing symbols not " +
+  "mentioned are left untouched. No activation needed - text elements take effect immediately once saved. " +
+  "Refuses to run on production profiles.",
+  {
+    objectName: z.string().describe("Program, class, or function group name, e.g. ZRM_STOCK_MOVEMENT_HK"),
+    objectType: z.enum(["PROG", "CLAS", "FUGR"]).optional().default("PROG").describe("Object kind. Default PROG (report/include)."),
+    symbols: z.array(z.object({
+      id: z.string().describe("3-character text symbol key, e.g. 001 or T01"),
+      text: z.string().describe("The symbol's text"),
+      maxLength: z.number().optional().describe("Optional max output length"),
+    })).min(1).describe("Text symbols to add or update"),
+    transport: z.string().optional().describe("Transport request, e.g. D01K900123. Omit only for local/$TMP objects."),
+  },
+  async ({ objectName, objectType, symbols, transport: corrNr }) => {
+    assertWritable();
+
+    const name = objectName.toUpperCase();
+    const uri = textElementsUri(objectType, name);
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    const mediaType = "application/vnd.sap.adt.textelements.symbols.v1";
+
+    // 1) read current symbols (404 just means none exist yet - not an error)
+    const probe = await call(`${uri}/source/symbols`, { method: "GET", accept: mediaType });
+    if (!probe.ok && probe.status !== 404) throw new Error(`Cannot read text symbols for ${name} (${probe.status}). ${probe.text}`);
+    const before = probe.ok ? parseTextElements(probe.text) : [];
+
+    // 2) merge - overwrite by id (case-insensitive), append anything new
+    const byId = new Map(before.map(el => [el.id.toUpperCase(), el]));
+    for (const s of symbols) {
+      const id = s.id.toUpperCase();
+      if (id.length !== 3) throw new Error(`Symbol key "${s.id}" must be exactly 3 characters.`);
+      byId.set(id, { id, text: s.text, maxLength: s.maxLength });
+    }
+    const merged = [...byId.values()];
+    log.push(`${before.length} existing symbol(s), ${symbols.length} upserted -> ${merged.length} total.`);
+
+    // 3) lock the TEXT ELEMENTS resource itself (not the object's source URI)
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    try {
+      const put = await call(
+        `${uri}/source/symbols?lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": `${mediaType}; charset=UTF-8`, Accept: mediaType }, body: formatTextElements(merged) }
+      );
+      if (!put.ok) throw new Error(`Text symbols PUT failed (${put.status}). ${put.text}`);
+      log.push(`Text symbols written${corrNr ? ` on ${corrNr}` : ""}. No activation needed.`);
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+        method: "POST",
+      });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
 server.tool(
   "update_table",
   "Overwrite the source (field definitions) of an EXISTING DDIC database table. Locks, PUTs the whole new DDL " +
@@ -2593,6 +3035,179 @@ server.tool(
 const classUri = n => `/sap/bc/adt/oo/classes/${n.toLowerCase()}`;
 const bdefUri = n => `/sap/bc/adt/bo/behaviordefinitions/${n.toLowerCase()}`;
 const srvdUri = n => `/sap/bc/adt/ddic/srvd/sources/${n.toLowerCase()}`;
+
+// A class's local types (CCIMP include, "Local Types" tab in ADT/Eclipse),
+// macros, and test classes are SEPARATE ADT sub-resources from its main
+// source (/source/main, which only holds DEFINITION/IMPLEMENTATION) -
+// update_class/patch_class can never reach them. Confirmed against the
+// open-source abap-adt-api client (github.com/marcellourbani/abap-adt-api,
+// src/api/objectstructure.ts): a class's object-structure response lists
+// each include as a <class:include> element carrying its OWN <atom:link>
+// source href - that client itself never hardcodes a URL for these, it
+// always discovers the href from this response. These two tools do the same.
+function parseClassIncludes(xml) {
+  const includes = [];
+  for (const m of xml.matchAll(/<class:include\b([^>]*)>([\s\S]*?)<\/class:include>/g)) {
+    const attr = (n) => (m[1].match(new RegExp(`${n}="([^"]*)"`)) || [])[1] || "";
+    const links = [...m[2].matchAll(/<atom:link\b([^>]*)\/?>/g)].map((lm) => {
+      const la = (n) => (lm[1].match(new RegExp(`${n}="([^"]*)"`)) || [])[1] || "";
+      return { href: la("href"), rel: la("rel") };
+    });
+    includes.push({ includeType: attr("class:includeType"), name: attr("adtcore:name"), links });
+  }
+  return includes;
+}
+
+// Pick the include's own source link - never a guessed/fixed URL pattern
+// (see above). Prefers a link that looks like a source endpoint; ambiguous
+// otherwise so a wrong guess can never silently read/write the wrong thing.
+function classIncludeSourceUri(include, host) {
+  const bySuffix = include.links.find((l) => /\/source\/main$/i.test(l.href));
+  const byRel = bySuffix || include.links.find((l) => /source/i.test(l.rel || ""));
+  const link = byRel || (include.links.length === 1 ? include.links[0] : null);
+  if (!link) return null;
+  // Normalize an absolute href (scheme+host) back to a path, since every
+  // caller in this file builds requests as `${host}${path}`.
+  if (link.href.startsWith(host)) return link.href.slice(host.length);
+  if (/^https?:\/\//i.test(link.href)) {
+    try { const u = new URL(link.href); return u.pathname + u.search; } catch { return link.href; }
+  }
+  return link.href;
+}
+
+server.tool(
+  "list_class_includes",
+  "List a class's separate ADT includes - e.g. local types (the CCIMP include / 'Local " +
+  "Types' tab in ADT), macros, test classes - each a DIFFERENT source object from the " +
+  "class's own main source (/source/main = DEFINITION/IMPLEMENTATION only). Run this " +
+  "BEFORE patch_class_include: it reports the exact includeType string THIS system uses " +
+  "(never guessed) so you can target the right one. Read-only, safe on any profile " +
+  "including production.",
+  {
+    className: z.string().describe("Class name, e.g. ZCL_ABL_PLANT_EMAIL"),
+  },
+  async ({ className }) => {
+    const name = className.toUpperCase();
+    const host = profile().host;
+    const xml = await adtGet(classUri(className), "*/*");
+    const includes = parseClassIncludes(xml);
+    if (!includes.length) {
+      return { content: [{ type: "text", text: `${name} reports no separate includes - only its main source exists.` }] };
+    }
+    const lines = includes.map((inc) => {
+      const src = classIncludeSourceUri(inc, host);
+      const raw = inc.links.map((l) => `${l.rel || "(no rel)"} -> ${l.href}`).join("; ");
+      return `${inc.includeType || "(no includeType)"} (${inc.name || name}): ` +
+        (src ? `source = ${src}` : `AMBIGUOUS - raw links: ${raw}`);
+    });
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+server.tool(
+  "patch_class_include",
+  "Modify PART of a class's SEPARATE include - local types (CCIMP / 'Local Types' tab), " +
+  "macros, or test classes - none of which live in /source/main (patch_class/update_class " +
+  "cannot reach these). Run list_class_includes FIRST to get the exact includeType string. " +
+  "Reads the include's current source, replaces oldString with newString (must match " +
+  "EXACTLY ONCE), locks the class, PUTs to the discovered include source, unlocks, and " +
+  "optionally activates the class. Refuses to run on production profiles.",
+  {
+    className: z.string().describe("Class name, e.g. ZCL_ABL_PLANT_EMAIL"),
+    includeType: z.string().describe("Exact includeType reported by list_class_includes for the include you want to edit"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate the class after writing. Default false."),
+  },
+  async ({ className, includeType, oldString, newString, transport: corrNr, activate }) => {
+    assertWritable();
+    const name = className.toUpperCase();
+    const uri = classUri(className);
+    const host = profile().host;
+    const log = [];
+
+    const structXml = await adtGet(uri, "*/*");
+    const includes = parseClassIncludes(structXml);
+    const include = includes.find((i) => i.includeType.toLowerCase() === includeType.toLowerCase());
+    if (!include) {
+      const available = includes.map((i) => i.includeType || "(blank)").join(", ") || "(none found)";
+      throw new Error(`No include of type "${includeType}" on ${name}. Available: ${available}. Run list_class_includes to check.`);
+    }
+    const sourceUri = classIncludeSourceUri(include, host);
+    if (!sourceUri) {
+      throw new Error(
+        `Found the "${includeType}" include on ${name} but its source link is ambiguous. ` +
+        `Run list_class_includes to see its raw links and report this.`
+      );
+    }
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    // 1) read the include's current source (this tool edits; it never creates)
+    const probe = await call(sourceUri, { method: "GET", accept: "text/plain" });
+    if (!probe.ok) throw new Error(`Cannot read ${name}'s "${includeType}" include (${probe.status}). ${probe.text}`);
+    const before = String(probe.text).replace(/\r\n/g, "\n");
+    const after = replaceOnce(oldString, newString, name)(before, log);
+    log.push(`Target: ${sourceUri}`);
+    log.push(`Lines ${before.split("\n").length} -> ${after.split("\n").length}.`);
+
+    // 2) lock the CLASS (locks are per top-level object, not per include)
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    let wrote = false;
+    try {
+      // 3) PUT to the include's OWN source uri, under the class's lock handle
+      const sep = sourceUri.includes("?") ? "&" : "?";
+      const put = await call(
+        `${sourceUri}${sep}lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: after }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      // 4) unlock the CLASS
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+        method: "POST",
+      });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    // 5) activate the CLASS (activation is always per top-level object)
+    if (wrote && activate) await runActivation(call, uri, name, log, "class");
+    else if (wrote) log.push("Not activated (activate=false) - activate it yourself or with activate_object.");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
 
 server.tool(
   "update_class",
