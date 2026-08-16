@@ -1886,6 +1886,180 @@ server.tool(
   }
 );
 
+// Pulls every tm:xxx="..." attribute out of one opening tag, generically -
+// verified against the open-source abap-adt-api client's transportDetails()
+// (GET /sap/bc/adt/cts/transportrequests/{tr}, media type
+// application/vnd.sap.adt.transportorganizer.v1+xml): the response is a
+// <tm:request> with tm:number/tm:desc/tm:owner/tm:status/tm:type attributes,
+// nested <tm:task> elements with the same attribute shape, and
+// <tm:abap_object tm:pgmid=".." tm:type=".." tm:name=".."/> entries for the
+// objects registered under it. Reading attributes generically (rather than
+// a fixed list) means an SAP-version field we haven't seen still shows up.
+function tmAttrs(tagStr) {
+  const out = {};
+  for (const m of String(tagStr || "").matchAll(/tm:([\w-]+)="([^"]*)"/g)) out[m[1]] = decodeXml(m[2]);
+  return out;
+}
+
+server.tool(
+  "get_transport_details",
+  "Inspect ONE transport request: its description/owner/status, its tasks (with their own owners/status), " +
+  "and every ABAP object registered under it. Use this to see what a transport actually contains before " +
+  "releasing it, or to check who owns which task. Read-only and safe on any profile.",
+  {
+    transport: z.string().describe("Transport request number, e.g. D01K900123"),
+  },
+  async ({ transport }) => {
+    const tr = transport.toUpperCase();
+    const xml = await adtGet(
+      `/sap/bc/adt/cts/transportrequests/${encodeURIComponent(tr)}`,
+      "application/vnd.sap.adt.transportorganizer.v1+xml"
+    );
+
+    const rootMatch = xml.match(/<tm:request\b([^>]*)>/) || xml.match(/<tm:request\b([^>]*)\/>/);
+    if (!rootMatch) throw new Error(`Could not parse a transport request from the response for ${tr}. ${xml.slice(0, 500)}`);
+    const root = tmAttrs(rootMatch[1]);
+
+    const tasks = [...xml.matchAll(/<tm:task\b([^>]*)>/g)].map(m => tmAttrs(m[1]));
+
+    // The same object shows up 2-3x (once loose under the request, again
+    // inside <tm:all_objects>, again inside its owning <tm:task>) - confirmed
+    // live. pgmid CORR entries are just "request released" log comments, not
+    // real objects. Dedupe by pgmid+type+name and drop the CORR noise.
+    const seen = new Set();
+    const objects = [...xml.matchAll(/<tm:abap_object\b([^>]*)\/?>/g)]
+      .map(m => tmAttrs(m[1]))
+      .filter(o => o.pgmid !== "CORR")
+      .filter(o => {
+        const key = `${o.pgmid}|${o.type}|${o.name}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+    const log = [
+      `${root.number || tr}  [${root.status_text || root.status || "?"}]${root.type ? `  type ${root.type}` : ""}`,
+      `Description: ${root.desc || "(none)"}`,
+      `Owner: ${root.owner || "?"}${root.target ? `   Target: ${root.target}${root.target_desc ? ` (${root.target_desc})` : ""}` : ""}`,
+    ];
+    if (tasks.length) {
+      log.push(`\nTasks (${tasks.length}):`);
+      for (const t of tasks) log.push(`  ${t.number}  [${t.status_text || t.status || "?"}]  owner ${t.owner || "?"}  "${t.desc || ""}"`);
+    } else {
+      log.push("\nTasks: none");
+    }
+    if (objects.length) {
+      log.push(`\nObjects (${objects.length}):`);
+      for (const o of objects) {
+        const name = (o.name || "?").replace(/\s+/g, " ").trim();
+        log.push(`  ${o.wbtype || o.type || "?"}  ${name}${o.obj_desc ? `  - ${o.obj_desc}` : ""}`);
+      }
+    } else {
+      log.push("\nObjects: none registered yet.");
+    }
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+// Extracts every LEAF element (a tag with no nested child elements) from an
+// XML fragment as flat key/value pairs - deliberately schema-agnostic. The
+// asx:abap/asx:values envelope this tool reads back from
+// /sap/bc/adt/cts/transportchecks nests plain ABAP-structure field names
+// (TRKORR, AS4TEXT, ...) that aren't documented anywhere public; grabbing
+// every leaf rather than a hand-picked list means the real field names
+// surface without having to guess them.
+function leafFields(fragment) {
+  const out = {};
+  for (const m of String(fragment || "").matchAll(/<(\w+)>([^<]*)<\/\1>/g)) {
+    if (!(m[1] in out)) out[m[1]] = decodeXml(m[2]);
+  }
+  return out;
+}
+
+server.tool(
+  "check_transport_lock",
+  "Check whether an object is ALREADY locked/registered in some other open transport request - the thing " +
+  "that causes 'object is locked in request X' conflicts. Also lists which of your own open requests the " +
+  "object could be assigned to. This is a dry-run check (verified against the ADT 'transportchecks' " +
+  "endpoint abap-adt-api uses) - it changes nothing. Read-only and safe on any profile.",
+  {
+    objectUri: z.string().describe("ADT URI of the object, e.g. /sap/bc/adt/oo/classes/zcl_foo"),
+    devclass: z.string().optional().describe("The object's package (dev class), e.g. ZHRY_ABAP_PP. Needed to find candidate requests; omit if you only care about existing locks."),
+    operation: z.enum(["I", "U", "D"]).optional().default("U")
+      .describe("I = as if inserting a new object, U = as if updating an existing one (default), D = as if deleting it."),
+  },
+  async ({ objectUri, devclass, operation }) => {
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const mediaType = "application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.transport.service.checkData";
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?><asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">\n` +
+      `  <asx:values>\n` +
+      `    <DATA>\n` +
+      `      <DEVCLASS>${escapeXml(devclass || "")}</DEVCLASS>\n` +
+      `      <OPERATION>${escapeXml(operation)}</OPERATION>\n` +
+      `      <URI>${escapeXml(objectUri)}</URI>\n` +
+      `    </DATA>\n` +
+      `  </asx:values>\n` +
+      `</asx:abap>`;
+
+    const res = await fetch(`${profile().host}/sap/bc/adt/cts/transportchecks`, {
+      method: "POST",
+      headers: { ...authHeaders(mediaType), "X-CSRF-Token": token, "Content-Type": mediaType, Cookie: cookies },
+      body,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Transport check failed (${res.status}). ${text}`);
+
+    const dataBlock = (text.match(/<DATA>([\s\S]*)<\/DATA>/) || [])[1] || text;
+
+    const lockBlock = (dataBlock.match(/<LOCKS>([\s\S]*?)<\/LOCKS>/) || [])[1] || "";
+    const holderHeader = (lockBlock.match(/<REQ_HEADER>([\s\S]*?)<\/REQ_HEADER>/) || [])[1] || "";
+    const holder = leafFields(holderHeader);
+
+    const requestBlocks = [...dataBlock.matchAll(/<CTS_REQUEST>([\s\S]*?)<\/CTS_REQUEST>/g)];
+    const candidates = requestBlocks.map(m => {
+      const header = (m[1].match(/<REQ_HEADER>([\s\S]*?)<\/REQ_HEADER>/) || [])[1] || "";
+      return leafFields(header);
+    });
+
+    const messageBlocks = [...dataBlock.matchAll(/<CTS_MESSAGE>([\s\S]*?)<\/CTS_MESSAGE>/g)];
+    const messages = messageBlocks.map(m => leafFields(m[1]));
+
+    // REQ_HEADER field names (TRKORR, TRSTATUS, TARSYSTEM, AS4USER, AS4TEXT, ...)
+    // confirmed live against a real system - this is the plain CTS request-
+    // header structure, not documented in the ADT REST docs.
+    const label = (s) => (s === "R" ? "released" : s === "D" ? "modifiable" : s || "?");
+    const reqLine = (r) =>
+      `${r.TRKORR || "?"}  [${label(r.TRSTATUS)}]  ${r.AS4TEXT || ""}` +
+      `${r.AS4USER ? `  (owner ${r.AS4USER})` : ""}${r.TARSYSTEM ? `  target ${r.TARSYSTEM}` : ""}`;
+    const fmt = (f) => Object.entries(f).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join("  ");
+
+    const log = [`Transport check for ${objectUri} (operation ${operation})`];
+    if (holder.TRKORR) {
+      log.push(`\nLOCKED in an existing request:`);
+      log.push(`  ${reqLine(holder)}`);
+    } else {
+      log.push(`\nNot currently locked by any other request.`);
+    }
+    if (candidates.length) {
+      const MAX = 15;
+      log.push(`\nCandidate request(s) you could assign it to (${candidates.length}):`);
+      for (const c of candidates.slice(0, MAX)) log.push(`  ${reqLine(c)}`);
+      if (candidates.length > MAX) log.push(`  ... and ${candidates.length - MAX} more.`);
+    }
+    if (messages.length) {
+      log.push(`\nMessages:`);
+      for (const m of messages) log.push(`  ${fmt(m)}`);
+    }
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
 server.tool(
   "syntax_check",
   "Run the ABAP syntax/consistency check (the same check ADT runs) on an existing object WITHOUT activating " +
