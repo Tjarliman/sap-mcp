@@ -513,6 +513,30 @@ server.tool(
 );
 
 server.tool(
+  "get_class_source",
+  "Read the ABAP source code of a class's main include (definition + implementation) from SAP S/4HANA",
+  {
+    className: z.string().describe("Exact class name, e.g. ZCL_MY_CLASS"),
+  },
+  async ({ className }) => {
+    const xml = await adtGet(`/sap/bc/adt/oo/classes/${className.toLowerCase()}/source/main`, "text/plain");
+    return { content: [{ type: "text", text: xml }] };
+  }
+);
+
+server.tool(
+  "get_cds_source",
+  "Read the DDL source of a CDS view from SAP S/4HANA",
+  {
+    cdsName: z.string().describe("Exact CDS view name, e.g. ZI_MY_VIEW"),
+  },
+  async ({ cdsName }) => {
+    const xml = await adtGet(`/sap/bc/adt/ddic/ddl/sources/${cdsName.toLowerCase()}/source/main`, "text/plain");
+    return { content: [{ type: "text", text: xml }] };
+  }
+);
+
+server.tool(
   "list_package_objects",
   "List all repository objects inside an SAP package",
   {
@@ -3376,6 +3400,104 @@ server.tool(
     }
 
     // 5) activate the CLASS (activation is always per top-level object)
+    if (wrote && activate) await runActivation(call, uri, name, log, "class");
+    else if (wrote) log.push("Not activated (activate=false) - activate it yourself or with activate_object.");
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
+  "update_class_include",
+  "Overwrite the WHOLE source of a class's SEPARATE include - local types (CCIMP / 'Local Types' tab), " +
+  "definitions, implementations, macros, or test classes - none of which live in /source/main " +
+  "(update_class/patch_class cannot reach these). Run list_class_includes FIRST to get the exact includeType " +
+  "string. Use this instead of patch_class_include when the include is empty/new (nothing to pattern-match " +
+  "against) or you're replacing all of it. Locks the class, PUTs the whole new source to the discovered " +
+  "include, unlocks, and optionally activates the class. Refuses to run on production profiles.",
+  {
+    className: z.string().describe("Class name, e.g. ZCL_ABL_PLANT_EMAIL"),
+    includeType: z.string().describe("Exact includeType reported by list_class_includes for the include you want to write"),
+    source: z.string().describe("Complete new source for this include - REPLACES its entire content"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+    activate: z.boolean().optional().default(false).describe("Activate the class after writing. Default false."),
+  },
+  async ({ className, includeType, source, transport: corrNr, activate }) => {
+    assertWritable();
+    const name = className.toUpperCase();
+    const uri = classUri(className);
+    const host = profile().host;
+    const log = [];
+
+    const structXml = await adtGet(uri, "*/*");
+    const includes = parseClassIncludes(structXml);
+    const include = includes.find((i) => i.includeType.toLowerCase() === includeType.toLowerCase());
+    if (!include) {
+      const available = includes.map((i) => i.includeType || "(blank)").join(", ") || "(none found)";
+      throw new Error(`No include of type "${includeType}" on ${name}. Available: ${available}. Run list_class_includes to check.`);
+    }
+    const sourceUri = classIncludeSourceUri(include, host);
+    if (!sourceUri) {
+      throw new Error(
+        `Found the "${includeType}" include on ${name} but its source link is ambiguous. ` +
+        `Run list_class_includes to see its raw links and report this.`
+      );
+    }
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      return { ok: res.ok, status: res.status, text: await res.text() };
+    };
+
+    log.push(`Target: ${sourceUri}`);
+
+    // 1) lock the CLASS (locks are per top-level object, not per include)
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    let wrote = false;
+    try {
+      // 2) PUT the whole new source to the include's OWN source uri, under the class's lock handle
+      const sep = sourceUri.includes("?") ? "&" : "?";
+      const put = await call(
+        `${sourceUri}${sep}lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written${corrNr ? ` on ${corrNr}` : ""}.`);
+      wrote = true;
+    } finally {
+      // 3) unlock the CLASS
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+        method: "POST",
+      });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    // 4) activate the CLASS (activation is always per top-level object)
     if (wrote && activate) await runActivation(call, uri, name, log, "class");
     else if (wrote) log.push("Not activated (activate=false) - activate it yourself or with activate_object.");
 
