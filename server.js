@@ -3259,18 +3259,27 @@ function parseClassIncludes(xml) {
 // Pick the include's own source link - never a guessed/fixed URL pattern
 // (see above). Prefers a link that looks like a source endpoint; ambiguous
 // otherwise so a wrong guess can never silently read/write the wrong thing.
-function classIncludeSourceUri(include, host) {
+//
+// This system's ADT reports these hrefs as BARE RELATIVE paths (e.g.
+// "includes/definitions", no leading slash - confirmed live against
+// ZMMCL_BP_GOODS_MVT on DS4100) rather than absolute ones, so they must be
+// resolved against the class's own base URI, not just normalized. Every
+// caller here builds requests as `${host}${path}`, so the result is always
+// handed back as a path (never scheme+host).
+function classIncludeSourceUri(include, host, baseUri) {
   const bySuffix = include.links.find((l) => /\/source\/main$/i.test(l.href));
   const byRel = bySuffix || include.links.find((l) => /source/i.test(l.rel || ""));
   const link = byRel || (include.links.length === 1 ? include.links[0] : null);
   if (!link) return null;
-  // Normalize an absolute href (scheme+host) back to a path, since every
-  // caller in this file builds requests as `${host}${path}`.
-  if (link.href.startsWith(host)) return link.href.slice(host.length);
-  if (/^https?:\/\//i.test(link.href)) {
-    try { const u = new URL(link.href); return u.pathname + u.search; } catch { return link.href; }
+  try {
+    // The trailing "/" on the base is essential: without it, WHATWG URL
+    // resolution treats the class name as a "file" and replaces it instead
+    // of appending the relative segment underneath it.
+    const resolved = new URL(link.href, `${host}${baseUri}/`);
+    return resolved.pathname + resolved.search;
+  } catch {
+    return null;
   }
-  return link.href;
 }
 
 server.tool(
@@ -3293,7 +3302,7 @@ server.tool(
       return { content: [{ type: "text", text: `${name} reports no separate includes - only its main source exists.` }] };
     }
     const lines = includes.map((inc) => {
-      const src = classIncludeSourceUri(inc, host);
+      const src = classIncludeSourceUri(inc, host, classUri(className));
       const raw = inc.links.map((l) => `${l.rel || "(no rel)"} -> ${l.href}`).join("; ");
       return `${inc.includeType || "(no includeType)"} (${inc.name || name}): ` +
         (src ? `source = ${src}` : `AMBIGUOUS - raw links: ${raw}`);
@@ -3332,7 +3341,7 @@ server.tool(
       const available = includes.map((i) => i.includeType || "(blank)").join(", ") || "(none found)";
       throw new Error(`No include of type "${includeType}" on ${name}. Available: ${available}. Run list_class_includes to check.`);
     }
-    const sourceUri = classIncludeSourceUri(include, host);
+    const sourceUri = classIncludeSourceUri(include, host, uri);
     if (!sourceUri) {
       throw new Error(
         `Found the "${includeType}" include on ${name} but its source link is ambiguous. ` +
@@ -3436,7 +3445,7 @@ server.tool(
       const available = includes.map((i) => i.includeType || "(blank)").join(", ") || "(none found)";
       throw new Error(`No include of type "${includeType}" on ${name}. Available: ${available}. Run list_class_includes to check.`);
     }
-    const sourceUri = classIncludeSourceUri(include, host);
+    const sourceUri = classIncludeSourceUri(include, host, uri);
     if (!sourceUri) {
       throw new Error(
         `Found the "${includeType}" include on ${name} but its source link is ambiguous. ` +
