@@ -3794,5 +3794,146 @@ server.tool(
   }
 );
 
+// --- BSP / UI5 repository files (MIME repository, NOT a normal ADT object) -
+// A deployed UI5/Fiori app's webapp files (Component.js, views, controllers,
+// manifest.json, ...) live in the BSP filestore, a completely separate ADT
+// sub-tree from PROG/CLAS/CDS/etc: /sap/bc/adt/filestore/ui5-bsp/objects/...
+// No create_*/update_*/patch_* tool above can reach these - confirmed by
+// searching every declared collection, and verified against the open-source
+// nwabap-ui5uploader deploy tool (github.com/nrdev88/nwabap-ui5uploader,
+// lib/filestore.js), which this implementation mirrors:
+//   - the BSP name + relative path are joined into ONE path segment and
+//     percent-encoded together (a literal "/" inside becomes %2F)
+//   - reading/writing a file's content is a plain GET/PUT on that segment
+//     plus "/content" - unlike source objects, there is NO lock/unlock
+//     ceremony at all; PUT instead sends "If-Match: *"
+//   - listing a folder is a GET on its segment + "/content", returning an
+//     Atom feed of <atom:entry> children (atom:category@term = folder/file)
+const BSP_BASE = "/sap/bc/adt/filestore/ui5-bsp/objects";
+const bspSegment = (bspName, relPath) =>
+  encodeURIComponent(`${bspName.toUpperCase()}${relPath ? "/" + relPath.replace(/^\/+/, "") : ""}`);
+
+server.tool(
+  "list_bsp_files",
+  "List the files/folders inside a deployed BSP/UI5 repository app (e.g. a Fiori app's webapp folder) - " +
+  "read-only. Use this to find the exact relative path of a file before calling get_bsp_file/update_bsp_file. " +
+  "This is a SEPARATE repository from PROG/CLAS/CDS - no other tool can browse it.",
+  {
+    bspName: z.string().describe("BSP application name, e.g. ZMMUIGRACCEPT"),
+    folderPath: z.string().optional().describe("Relative folder path inside the app, e.g. webapp/controller. Omit for the root."),
+  },
+  async ({ bspName, folderPath }) => {
+    const path = `${BSP_BASE}/${bspSegment(bspName, folderPath)}/content`;
+    const xml = await adtGet(path, "application/atom+xml");
+    const entries = [...xml.matchAll(/<atom:entry\b[^>]*>([\s\S]*?)<\/atom:entry>/g)].map(m => {
+      const body = m[1];
+      const id = (body.match(/<atom:id>([\s\S]*?)<\/atom:id>/) || [])[1] || "";
+      const term = (body.match(/<atom:category[^>]*\bterm="([^"]*)"/) || [])[1] || "";
+      const title = (body.match(/<atom:title[^>]*>([\s\S]*?)<\/atom:title>/) || [])[1] || "";
+      return { name: decodeXml(title) || decodeXml(id), type: /folder/i.test(term) ? "folder" : "file" };
+    }).filter(e => e.name);
+    if (!entries.length) return { content: [{ type: "text", text: `No entries found under ${bspName}${folderPath ? "/" + folderPath : ""} (or the app doesn't exist).` }] };
+    const lines = entries.map(e => `${e.type === "folder" ? "[dir] " : "      "}${e.name}`);
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  }
+);
+
+server.tool(
+  "get_bsp_file",
+  "Read the raw content of a single file inside a deployed BSP/UI5 repository app (e.g. Component.js, a " +
+  "controller, manifest.json). Use list_bsp_files first to confirm the exact relative path. Read-only, safe " +
+  "on any profile including production.",
+  {
+    bspName: z.string().describe("BSP application name, e.g. ZMMUIGRACCEPT"),
+    filePath: z.string().describe("Relative file path inside the app, e.g. webapp/controller/Main.controller.js"),
+  },
+  async ({ bspName, filePath }) => {
+    const path = `${BSP_BASE}/${bspSegment(bspName, filePath)}/content`;
+    const text = await adtGet(path, "*/*");
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.tool(
+  "update_bsp_file",
+  "Overwrite the WHOLE content of an EXISTING file inside a deployed BSP/UI5 repository app. Unlike source " +
+  "objects there is no lock/unlock step and no activation - the write takes effect immediately. Read the " +
+  "file first with get_bsp_file, edit that text, and send the complete result back. Refuses to run on " +
+  "production profiles.",
+  {
+    bspName: z.string().describe("BSP application name, e.g. ZMMUIGRACCEPT"),
+    filePath: z.string().describe("Relative file path inside the app, e.g. webapp/controller/Main.controller.js"),
+    content: z.string().describe("Complete new file content - REPLACES the whole file"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+  },
+  async ({ bspName, filePath, content, transport: corrNr }) => {
+    assertWritable();
+    const host = profile().host;
+    const path = `${BSP_BASE}/${bspSegment(bspName, filePath)}/content` +
+      `?isBinary=false&charset=UTF-8` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : "");
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+    const res = await fetch(`${host}${path}`, {
+      method: "PUT",
+      headers: {
+        ...authHeaders("*/*"),
+        "X-CSRF-Token": token,
+        Cookie: initialCookies,
+        "Content-Type": "application/octet-stream",
+        "If-Match": "*",
+      },
+      body: content,
+      agent,
+    });
+    if (!res.ok) throw new Error(`BSP file PUT failed (${res.status}). ${await res.text()}`);
+    return { content: [{ type: "text", text: `Wrote ${content.length} bytes to ${bspName}/${filePath}${corrNr ? ` on ${corrNr}` : ""}. No activation needed.` }] };
+  }
+);
+
+server.tool(
+  "patch_bsp_file",
+  "Modify PART of an existing BSP/UI5 repository file without resending the whole content. Reads the current " +
+  "content, replaces oldString with newString (must match EXACTLY ONCE), then writes it back. Prefer this " +
+  "over update_bsp_file for small edits. Refuses to run on production profiles.",
+  {
+    bspName: z.string().describe("BSP application name, e.g. ZMMUIGRACCEPT"),
+    filePath: z.string().describe("Relative file path inside the app, e.g. webapp/controller/Main.controller.js"),
+    oldString: z.string().describe("Exact existing text to replace. Must occur exactly once - include enough context to be unique."),
+    newString: z.string().describe("Replacement text"),
+    transport: z.string().optional().describe("Transport request. Omit only for local/$TMP objects."),
+  },
+  async ({ bspName, filePath, oldString, newString, transport: corrNr }) => {
+    assertWritable();
+    const host = profile().host;
+    const contentPath = `${BSP_BASE}/${bspSegment(bspName, filePath)}/content`;
+
+    const before = await adtGet(contentPath, "*/*");
+    if (!oldString) throw new Error("oldString must not be empty.");
+    const hits = before.split(oldString).length - 1;
+    if (hits === 0) throw new Error(`oldString not found in ${bspName}/${filePath}. Nothing written.`);
+    if (hits > 1) throw new Error(`oldString matched ${hits} times in ${bspName}/${filePath}. Nothing written. Add surrounding context to make it unique.`);
+    const after = before.replace(oldString, newString);
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+    const putPath = contentPath + `?isBinary=false&charset=UTF-8` + (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : "");
+    const res = await fetch(`${host}${putPath}`, {
+      method: "PUT",
+      headers: {
+        ...authHeaders("*/*"),
+        "X-CSRF-Token": token,
+        Cookie: initialCookies,
+        "Content-Type": "application/octet-stream",
+        "If-Match": "*",
+      },
+      body: after,
+      agent,
+    });
+    if (!res.ok) throw new Error(`BSP file PUT failed (${res.status}). ${await res.text()}`);
+    return { content: [{ type: "text", text: `Patched 1 occurrence in ${bspName}/${filePath}${corrNr ? ` on ${corrNr}` : ""}. Lines ${before.split("\n").length} -> ${after.split("\n").length}. No activation needed.` }] };
+  }
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
