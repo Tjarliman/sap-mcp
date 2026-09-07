@@ -832,6 +832,110 @@ server.tool(
 );
 
 server.tool(
+  "create_include",
+  "Create a new classic ABAP INCLUDE program (type PROG/I) in SAP and activate it - a SEPARATE ADT " +
+  "collection from create_program's executable reports (PROG/P), verified against the open-source " +
+  "abap-adt-api client rather than guessed: /sap/bc/adt/programs/includes, not /programs/programs. " +
+  "Refuses to run on production profiles. No INCLUDE statement is added to any main program here - do that " +
+  "separately with patch_program_source on the program that should include it.",
+  {
+    includeName: z.string().describe("Include name, e.g. ZHELLO_WORLDTOP"),
+    description: z.string().describe("Short description shown in SE38/SE80"),
+    packageName: z.string().describe("Package, e.g. ZABAP. Use $TMP for a local throwaway include."),
+    source: z.string().describe("Complete ABAP source for the include"),
+    transport: z.string().optional().describe("Transport request, e.g. ABLK900123. Omit only for $TMP."),
+    activate: z.boolean().optional().default(true).describe("Activate after writing the source"),
+  },
+  async ({ includeName, description, packageName, source, transport: corrNr, activate }) => {
+    assertWritable();
+    if (!source || !source.trim()) throw new Error("Refusing to create an include with empty source.");
+
+    const name = includeName.toUpperCase();
+    const uri = `/sap/bc/adt/programs/includes/${includeName.toLowerCase()}`;
+    const host = profile().host;
+    const log = [];
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    const call = async (path, { method, headers = {}, body, accept = "*/*" }) => {
+      const res = await fetch(`${host}${path}`, {
+        method,
+        headers: {
+          ...authHeaders(accept),
+          "X-CSRF-Token": token,
+          "x-sap-adt-sessiontype": "stateful",
+          Cookie: cookies,
+          ...headers,
+        },
+        body,
+        agent,
+      });
+      cookies = mergeCookies(cookies, res);
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, text };
+    };
+
+    // 1) create the (empty) include shell
+    const corrQuery = corrNr ? `?corrNr=${encodeURIComponent(corrNr)}` : "";
+    const shell =
+      `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<include:abapInclude xmlns:include="http://www.sap.com/adt/programs/includes" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" ` +
+      `adtcore:name="${escapeXml(name)}" adtcore:type="PROG/I" ` +
+      `adtcore:description="${escapeXml(description)}" ` +
+      `adtcore:language="EN" adtcore:masterLanguage="EN">\n` +
+      `  <adtcore:packageRef adtcore:name="${escapeXml(packageName.toUpperCase())}"/>\n` +
+      `</include:abapInclude>`;
+
+    const created = await call(`/sap/bc/adt/programs/includes${corrQuery}`, {
+      method: "POST",
+      // abap-adt-api uses a generic "application/*" for EVERY object-creation
+      // POST regardless of type (no per-type content-type in its own
+      // CreatableType table) - matching that verified value here rather than
+      // guessing a specific vnd.sap.adt.* string for includes.
+      headers: { "Content-Type": "application/*" },
+      body: shell,
+    });
+    if (!created.ok) throw new Error(`Create failed (${created.status}). ${created.text}`);
+    log.push(`Created shell ${name} in package ${packageName.toUpperCase()}${corrNr ? ` on ${corrNr}` : ""}.`);
+
+    // 2) lock  3) put source  4) unlock — one stateful session
+    const locked = await call(`${uri}?_action=LOCK&accessMode=MODIFY`, {
+      method: "POST",
+      accept: "application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.lock.Result",
+    });
+    if (!locked.ok) throw new Error(`Lock failed (${locked.status}). ${locked.text}`);
+    const handle = (locked.text.match(/<LOCK_HANDLE>([^<]*)<\/LOCK_HANDLE>/) || [])[1];
+    if (!handle) throw new Error(`No lock handle returned. ${locked.text}`);
+    log.push("Locked.");
+
+    try {
+      const put = await call(
+        `${uri}/source/main?lockHandle=${encodeURIComponent(handle)}` +
+        (corrNr ? `&corrNr=${encodeURIComponent(corrNr)}` : ""),
+        { method: "PUT", headers: { "Content-Type": "text/plain; charset=utf-8" }, body: source }
+      );
+      if (!put.ok) throw new Error(`Source PUT failed (${put.status}). ${put.text}`);
+      log.push(`Source written (${source.split("\n").length} lines).`);
+    } finally {
+      const unlocked = await call(`${uri}?_action=UNLOCK&lockHandle=${encodeURIComponent(handle)}`, {
+        method: "POST",
+      });
+      log.push(unlocked.ok ? "Unlocked." : `WARNING: unlock failed (${unlocked.status}) - object may stay locked.`);
+    }
+
+    // Activate only after the edit lock is released.
+    if (activate) {
+      await runActivation(call, uri, name, log, "include");
+    }
+
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
   "create_cds",
   "Create a new CDS view (Data Definition / DDLS) in SAP and activate it. " +
   "Refuses to run on production profiles. Provide the complete CDS source " +
