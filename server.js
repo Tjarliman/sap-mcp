@@ -571,23 +571,40 @@ server.tool(
 
 server.tool(
   "get_table_info",
-  "Get structure and field definitions of a SAP DDIC table (e.g. EKKO, MARA, BSEG)",
+  "Get structure and field definitions of a SAP DDIC table or structure (e.g. EKKO, MARA, BSEG). " +
+  "Works for both transparent tables (TABL/TRANSP) and structures (TABL/DS) - falls back automatically.",
   {
-    tableName: z.string().describe("Table name, e.g. EKKO"),
+    tableName: z.string().describe("Table or structure name, e.g. EKKO"),
   },
   async ({ tableName }) => {
     const name = tableName.toUpperCase();
     const nameLower = tableName.toLowerCase();
-    const [meta, source] = await Promise.all([
-      adtGet(`/sap/bc/adt/ddic/tables/${nameLower}`, "*/*"),
-      adtGet(`/sap/bc/adt/ddic/tables/${nameLower}/source/main`, "text/plain"),
-    ]);
+    let kind = "Table";
+    let meta, source;
+    try {
+      [meta, source] = await Promise.all([
+        adtGet(`/sap/bc/adt/ddic/tables/${nameLower}`, "*/*"),
+        adtGet(`/sap/bc/adt/ddic/tables/${nameLower}/source/main`, "text/plain"),
+      ]);
+    } catch (err) {
+      // Not every DDIC object with fields is a transparent table - structures
+      // (TABL/DS, e.g. ACDOCA extension includes) 404 on the tables endpoint
+      // ("Error while importing object ... from the database") because they
+      // have no physical database representation. Retry against the
+      // structures endpoint before giving up, so the caller doesn't need to
+      // already know the object's exact DDIC subtype.
+      kind = "Structure";
+      [meta, source] = await Promise.all([
+        adtGet(`/sap/bc/adt/ddic/structures/${nameLower}`, "*/*"),
+        adtGet(`/sap/bc/adt/ddic/structures/${nameLower}/source/main`, "text/plain"),
+      ]);
+    }
     const descMatch = meta.match(/adtcore:description="([^"]*)"/);
     const description = descMatch ? descMatch[1] : "";
     return {
       content: [{
         type: "text",
-        text: `Table: ${name}\nDescription: ${description}\n\n--- Field Definitions ---\n${source}`,
+        text: `${kind}: ${name}\nDescription: ${description}\n\n--- Field Definitions ---\n${source}`,
       }],
     };
   }
