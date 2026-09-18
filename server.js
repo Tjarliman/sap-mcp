@@ -538,18 +538,26 @@ server.tool(
 
 server.tool(
   "list_package_objects",
-  "List all repository objects inside an SAP package",
+  "List all repository objects inside an SAP package (programs, classes, CDS views, tables, " +
+  "structures, data elements, domains, function groups, and everything else in it)",
   {
     packageName: z.string().describe("Package name, e.g. ZMYPACKAGE"),
+    maxResults: z.number().optional().default(100).describe("Max number of objects to return (default 100)"),
   },
-  async ({ packageName }) => {
+  async ({ packageName, maxResults }) => {
+    // No objectType filter - omitting it entirely is what makes ADT's
+    // quickSearch return every object type in the package instead of just
+    // one. A previous version hardcoded objectType=PROG here, so this tool
+    // silently only ever showed programs/includes, despite its own
+    // description promising "all repository objects".
     const xml = await adtGet(
-      `/sap/bc/adt/repository/informationsystem/search?operation=quickSearch&query=*&maxResults=100&objectType=PROG&packageName=${encodeURIComponent(packageName)}`
+      `/sap/bc/adt/repository/informationsystem/search?operation=quickSearch&query=*&maxResults=${maxResults}&packageName=${encodeURIComponent(packageName)}`
     );
     const refs = parseObjectRefs(xml);
     if (refs.length === 0) return { content: [{ type: "text", text: `No objects found in package ${packageName}.` }] };
     const lines = refs.map(r => `${r.name} (${r.type}) | ${r.description}`);
-    return { content: [{ type: "text", text: lines.join("\n") }] };
+    const capped = refs.length >= maxResults ? `\n\n(hit the ${maxResults}-result cap - raise maxResults if this package has more.)` : "";
+    return { content: [{ type: "text", text: lines.join("\n") + capped }] };
   }
 );
 
