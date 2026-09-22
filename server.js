@@ -2804,6 +2804,37 @@ function formatTextElements(elements) {
 }
 
 server.tool(
+  "get_text_elements",
+  "Read the raw TEXT SYMBOLS (TEXT-xxx) text-pool content for an existing ABAP program, class, or " +
+  "function group - the read-only counterpart to patch_text_elements (which can only write, not read). " +
+  "Returns the exact raw content ADT returns (line-based id=text pairs, with an @MaxLength:n marker " +
+  "where set) - useful for seeing precisely what's stored when debugging a mismatch, rather than " +
+  "guessing from patch_text_elements' own merge log. Read-only, safe on any profile including " +
+  "production.",
+  {
+    objectName: z.string().describe("Program, class, or function group name, e.g. ZRM_STOCK_MOVEMENT_HK"),
+    objectType: z.enum(["PROG", "CLAS", "FUGR"]).optional().default("PROG").describe("Object kind. Default PROG (report/include)."),
+  },
+  async ({ objectName, objectType }) => {
+    const name = objectName.toUpperCase();
+    const uri = textElementsUri(objectType, name);
+    const mediaType = "application/vnd.sap.adt.textelements.symbols.v1";
+    let text;
+    try {
+      text = await adtGet(`${uri}/source/symbols`, mediaType);
+    } catch (err) {
+      // A 404 here just means this object has no text symbols yet - same
+      // "not an error" treatment patch_text_elements already gives it.
+      if (/SAP ADT error 404/.test(String(err && err.message))) {
+        return { content: [{ type: "text", text: `${name} has no text symbols (or does not exist).` }] };
+      }
+      throw err;
+    }
+    return { content: [{ type: "text", text: text && text.trim() ? text : `${name} has no text symbols.` }] };
+  }
+);
+
+server.tool(
   "patch_text_elements",
   "Add or update TEXT SYMBOLS (TEXT-xxx) for an existing ABAP program, class, or function group. " +
   "This is a SEPARATE ADT object from the source code - update_program_source/update_class etc. cannot touch it. " +
