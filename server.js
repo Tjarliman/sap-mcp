@@ -2214,6 +2214,69 @@ server.tool(
 );
 
 server.tool(
+  "create_transport",
+  "Create a NEW transport request (a workbench request, CTS type K) for a package - the write counterpart " +
+  "to list_transports/get_transport_details. Use this when list_transports found no suitable open request " +
+  "and an object needs a request number before it can be created/updated. Refuses to run on production/" +
+  "read-only profiles. Returns the new request number, ready to pass as `transport` to the create/update " +
+  "tools.",
+  {
+    devclass: z.string().describe("Package (dev class) this transport is for, e.g. ZHRY_ABAP_PP. Must be a real transportable package - $TMP objects never need a transport."),
+    description: z.string().describe("Short description for the transport request (shown in SE09/SE10)."),
+    transportLayer: z.string().optional().describe("Transport layer override. Normally omit - SAP derives it from the package."),
+  },
+  async ({ devclass, description, transportLayer }) => {
+    assertWritable();
+    const dc = devclass.toUpperCase();
+    if (dc === "$TMP") throw new Error("$TMP is a local package and never needs a transport - omit `transport` entirely for $TMP objects.");
+    if (!description || !description.trim()) throw new Error("Refusing to create a transport with an empty description.");
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    // Verified against the open-source abap-adt-api client's createTransport()
+    // (github.com/marcellourbani/abap-adt-api, src/api/transports.ts): POST
+    // /sap/bc/adt/cts/transports with an asx:abap DATA envelope carrying
+    // DEVCLASS/REQUEST_TEXT/REF/OPERATION, dataname CreateCorrectionRequest.
+    // REF only has to be URL-SHAPED (ValidateObjectUrl there is a regex, not
+    // an existence check) - the package's own ADT URI works, so no real
+    // object needs to exist yet.
+    const mediaType = "application/vnd.sap.as+xml; charset=UTF-8; dataname=com.sap.adt.CreateCorrectionRequest";
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?><asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">\n` +
+      `  <asx:values>\n` +
+      `    <DATA>\n` +
+      `      <DEVCLASS>${escapeXml(dc)}</DEVCLASS>\n` +
+      `      <REQUEST_TEXT>${escapeXml(description)}</REQUEST_TEXT>\n` +
+      `      <REF>/sap/bc/adt/packages/${encodeURIComponent(devclass.toLowerCase())}</REF>\n` +
+      `      <OPERATION>I</OPERATION>\n` +
+      `    </DATA>\n` +
+      `  </asx:values>\n` +
+      `</asx:abap>`;
+
+    const qs = transportLayer ? `?transportLayer=${encodeURIComponent(transportLayer)}` : "";
+    const res = await fetch(`${profile().host}/sap/bc/adt/cts/transports${qs}`, {
+      method: "POST",
+      headers: { ...authHeaders("text/plain"), "X-CSRF-Token": token, "Content-Type": mediaType, Cookie: cookies },
+      body,
+      agent,
+    });
+    cookies = mergeCookies(cookies, res);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Create transport failed (${res.status}). ${text}`);
+
+    // Success returns the new request's own ADT URI as a plain-text body
+    // (e.g. "/sap/bc/adt/cts/transports/D01K900123") - the number is the
+    // last path segment.
+    const number = text.trim().split("/").filter(Boolean).pop();
+    if (!number) throw new Error(`Transport created but couldn't parse its number from the response: ${text}`);
+
+    return { content: [{ type: "text", text: `Created transport ${number} for package ${dc}: "${description}"` }] };
+  }
+);
+
+server.tool(
   "syntax_check",
   "Run the ABAP syntax/consistency check (the same check ADT runs) on an existing object WITHOUT activating " +
   "it. Read-only and safe on any profile, including production. Use this after writing source and BEFORE " +
