@@ -76,8 +76,11 @@ let activeProfile = PROFILES.ABLD ? "ABLD" : Object.keys(PROFILES)[0] || "ABLD";
 //   1. this built-in list (matched case-insensitively), and
 //   2. SAP_<KEY>_READONLY=true / SAP_<KEY>_PROD=true in .env.
 // They are ADDITIVE on purpose: a missing .env flag can never silently unblock
-// a system that was protected before.
-const WRITE_BLOCKED_PROFILES = new Set(["ABLP", "ABLQ"]);
+// a system that was protected before. PRD is blocked by name as a default
+// safety net for anyone following the DEV/QAS/PRD convention from
+// .env.example - name your production profile something else if you want
+// its write protection to depend solely on the .env flag.
+const WRITE_BLOCKED_PROFILES = new Set(["PRD"]);
 function isWriteBlocked(key) {
   const k = String(key || "").toUpperCase();
   if (WRITE_BLOCKED_PROFILES.has(k)) return true;
