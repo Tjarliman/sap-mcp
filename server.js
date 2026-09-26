@@ -23,12 +23,9 @@ try {
 // is only a fallback for the profiles this connector shipped with, so a new
 // system can be named without touching this file.
 const PROFILE_LABELS = {
-  ABLD: "Development",
-  DEV120: "Development (client 120)",
-  SNET: "QA/Test",
-  ABLQ: "QA/Test - Q01 (client 200)",
-  ABLP: "Production",
-  SNET2: "S/4HANA on-prem",
+  DEV: "Development",
+  QAS: "Quality Assurance",
+  PRD: "Production",
 };
 
 // Accepts the spellings people actually use for a boolean in a .env / in SAP.
