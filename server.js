@@ -2277,6 +2277,77 @@ server.tool(
 );
 
 server.tool(
+  "release_transport",
+  "Release a transport request (or task) - the write counterpart to get_transport_details. Runs SAP's " +
+  "standard release checks and moves it from modifiable to released, so it can be imported into the next " +
+  "system. Refuses to run on production/read-only profiles. Use get_transport_details first to see what's " +
+  "actually registered under it before releasing.",
+  {
+    transport: z.string().describe("Transport request or task number, e.g. D01K900123"),
+    ignoreLocks: z.boolean().optional().default(false)
+      .describe("Release even if some objects are locked in other requests. Only set this when you understand why - it can leave inconsistent state."),
+    ignoreAtcCheck: z.boolean().optional().default(false)
+      .describe("Skip the ATC (code quality) check that normally runs on release. Only set this when you understand why."),
+  },
+  async ({ transport, ignoreLocks, ignoreAtcCheck }) => {
+    assertWritable();
+    const tr = transport.toUpperCase().trim();
+    if (!tr) throw new Error("Transport number is required.");
+
+    const { token, cookies: initialCookies } = await fetchCsrfToken();
+    let cookies = initialCookies;
+    if (!token) throw new Error("Could not obtain a CSRF token - check credentials/profile.");
+
+    // Verified against the open-source abap-adt-api client's transportRelease()
+    // (github.com/marcellourbani/abap-adt-api, src/api/transports.ts): POST
+    // /sap/bc/adt/cts/transportrequests/{tr}/{action}, no body - action picks
+    // the release variant: newreleasejobs (normal), relwithignlock (skip lock
+    // conflicts), relObjigchkatc (skip the ATC check).
+    const action = ignoreAtcCheck ? "relObjigchkatc" : ignoreLocks ? "relwithignlock" : "newreleasejobs";
+    const res = await fetch(
+      `${profile().host}/sap/bc/adt/cts/transportrequests/${encodeURIComponent(tr)}/${action}`,
+      { method: "POST", headers: { ...authHeaders("application/*"), "X-CSRF-Token": token, Cookie: cookies }, agent }
+    );
+    cookies = mergeCookies(cookies, res);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Release failed for ${tr} (${res.status}). ${text}`);
+
+    // Response: <tm:root>...<tm:releasereports><chkrun:checkReport chkrun:reporter=".."
+    // chkrun:status="released|abortrelapifail" chkrun:statusText="..">
+    //   <chkrun:checkMessageList><chkrun:checkMessage chkrun:type=".." chkrun:shortText=".."/></...>
+    // </chkrun:checkReport>...  Extracted flat (report attrs, message attrs)
+    // rather than nested, since a self-closing <chkrun:checkReport/> with no
+    // messages would otherwise swallow the next sibling's content.
+    const attrsOf = (tagStr, ns) => {
+      const out = {};
+      for (const m of String(tagStr || "").matchAll(new RegExp(`${ns}:([\\w-]+)="([^"]*)"`, "g"))) out[m[1]] = decodeXml(m[2]);
+      return out;
+    };
+    const reports = [...text.matchAll(/<chkrun:checkReport\b([^>]*?)\/?>/g)].map(m => attrsOf(m[1], "chkrun"));
+    const messages = [...text.matchAll(/<chkrun:checkMessage\b([^>]*?)\/?>/g)].map(m => attrsOf(m[1], "chkrun"));
+
+    if (!reports.length && !messages.length) {
+      return { content: [{ type: "text", text: `Release request sent for ${tr}. No structured report came back - run get_transport_details to confirm its new status.` }] };
+    }
+
+    const log = [`Release result for ${tr}:`];
+    for (const r of reports) {
+      log.push(`  ${r.reporter || "?"}: ${r.status || "?"}${r.statusText ? ` - ${r.statusText}` : ""}`);
+    }
+    if (messages.length) {
+      log.push(`\nMessages:`);
+      for (const m of messages) log.push(`  [${m.type || "?"}] ${m.shortText || ""}${m.uri ? `  (${m.uri})` : ""}`);
+    }
+    const failed = reports.some(r => r.status && r.status !== "released");
+    if (failed) {
+      log.push(`\nNot fully released - see messages above. If appropriate, retry with ignoreLocks or ` +
+        `ignoreAtcCheck once you understand why it failed.`);
+    }
+    return { content: [{ type: "text", text: log.join("\n") }] };
+  }
+);
+
+server.tool(
   "syntax_check",
   "Run the ABAP syntax/consistency check (the same check ADT runs) on an existing object WITHOUT activating " +
   "it. Read-only and safe on any profile, including production. Use this after writing source and BEFORE " +
