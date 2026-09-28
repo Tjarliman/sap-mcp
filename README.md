@@ -16,7 +16,7 @@ MCP server for SAP S/4HANA via the ADT API. Runs locally over stdio.
 Then:
 
 ```bash
-git clone https://github.com/Tjarliman/sap-mcp.git
+git clone https://github.com/abap-studio/sap-mcp.git
 cd sap-mcp
 npm install
 cp .env.example .env      # PowerShell/CMD: copy .env.example .env
